@@ -421,3 +421,256 @@ class LeKiwi(Robot):
             cam.disconnect()
 
         logger.info(f"{self} disconnected.")
+
+
+
+class LeKiwiBase(LeKiwi):
+    """
+    A base-only version of LeKiwi:
+    - Only three omni wheels are used.
+    - No arm motors are present on the bus.
+    - Observations and actions only contain base velocities.
+    """
+
+    # 用同一套 LeKiwiConfig
+    config_class = LeKiwiConfig
+    # 这个名字很重要，在 CLI / config 里会用到
+    name = "lekiwi_base"
+
+    def __init__(self, config: LeKiwiConfig):
+        # 注意：**不要调用 super().__init__()**，
+        # 因为那里面会创建 arm + base 共 9 个电机
+        Robot.__init__(self, config)
+        self.config = config
+
+        # 底盘用的是速度模式归一化 [-100, 100]
+        norm_mode_body = (
+            MotorNormMode.DEGREES if config.use_degrees else MotorNormMode.RANGE_M100_100
+        )
+
+        # 这里只注册 3 个轮子，ID 7/8/9 要与你实际 Feetech 配置一致
+        self.bus = FeetechMotorsBus(
+            port=self.config.port,
+            motors={
+                "base_left_wheel":  Motor(7, "sts3215", MotorNormMode.RANGE_M100_100),
+                "base_back_wheel":  Motor(8, "sts3215", MotorNormMode.RANGE_M100_100),
+                "base_right_wheel": Motor(9, "sts3215", MotorNormMode.RANGE_M100_100),
+            },
+            calibration=self.calibration,
+        )
+
+        # 没有任何 arm 电机
+        self.arm_motors = []
+        self.base_motors = [motor for motor in self.bus.motors if motor.startswith("base")]
+
+        # 相机逻辑原样复用
+        self.cameras = make_cameras_from_configs(config.cameras)
+
+        # 底盘速度模式：0=Slow, 1=Medium, 2=Fast
+        self._speed_modes = [
+            {"lin": 0.1, "rot": 30.0},   # Slow
+            {"lin": 0.25, "rot": 60.0},  # Medium
+            {"lin": 0.4, "rot": 90.0},   # Fast
+        ]
+        self._speed_mode_idx = 1  # 默认 Medium
+
+
+
+    # ---------------- 状态/动作特征：只保留底盘 ---------------- #
+
+    @property
+    def _state_ft(self) -> dict[str, type]:
+        # 只包含底盘线速度 + 角速度
+        return dict.fromkeys(
+            (
+                "x.vel",
+                "y.vel",
+                "theta.vel",
+            ),
+            float,
+        )
+
+    @cached_property
+    def observation_features(self) -> dict[str, type | tuple]:
+        # 底盘状态 + 摄像头
+        return {**self._state_ft, **self._cameras_ft}
+
+    @cached_property
+    def action_features(self) -> dict[str, type]:
+        # 动作空间 = 状态空间（全是 vel）
+        return self._state_ft
+
+    # ---------------- 校准：仅底盘轮子，offset 设为 0 ---------------- #
+
+    def calibrate(self) -> None:
+        """
+        Base-only calibration:
+        - If calibration file exists, write it to motors.
+        - Otherwise, set all wheel homing offsets to 0 and save.
+        """
+        if self.calibration:
+            user_input = input(
+                f"Press ENTER to use provided calibration file associated with the id {self.id}, "
+                "or type 'c' and press ENTER to overwrite calibration: "
+            )
+            if user_input.strip().lower() != "c":
+                logger.info(f"Writing calibration file associated with the id {self.id} to the motors")
+                self.bus.write_calibration(self.calibration)
+                return
+
+        logger.info(f"\nRunning base-only calibration of {self}")
+
+        # 对底盘，我们简单地把 homing offset 设为 0
+        homing_offsets = dict.fromkeys(self.base_motors, 0)
+
+        # range_min / range_max 可以直接使用 full rotation
+        range_mins = {}
+        range_maxes = {}
+        for name, motor in self.bus.motors.items():
+            range_mins[name] = 0
+            range_maxes[name] = 4095
+
+        self.calibration = {}
+        for name, motor in self.bus.motors.items():
+            self.calibration[name] = MotorCalibration(
+                id=motor.id,
+                drive_mode=0,
+                homing_offset=homing_offsets[name],
+                range_min=range_mins[name],
+                range_max=range_maxes[name],
+            )
+
+        self.bus.write_calibration(self.calibration)
+        self._save_calibration()
+        print("Base-only calibration saved to", self.calibration_fpath)
+
+    # ---------------- 配置：只设置底盘为速度模式 ---------------- #
+
+    def configure(self):
+        # Disable torque first
+        self.bus.disable_torque()
+        # 让 FeetechBus 做基础配置（电压保护等）
+        self.bus.configure_motors()
+
+        # 底盘轮子用 VELOCITY 模式
+        for name in self.base_motors:
+            self.bus.write("Operating_Mode", name, OperatingMode.VELOCITY.value)
+
+        self.bus.enable_torque()
+
+    # ---------------- 电机 ID 设置脚本（仅底盘） ---------------- #
+
+    def setup_motors(self) -> None:
+        """
+        Setup only base motors IDs.
+        """
+        for motor in reversed(self.base_motors):
+            input(f"Connect the controller board to the '{motor}' motor only and press enter.")
+            self.bus.setup_motor(motor)
+            print(f"'{motor}' motor id set to {self.bus.motors[motor].id}")
+
+    # ---------------- 观测：只读轮子速度 + 摄像头 ---------------- #
+
+    def get_observation(self) -> dict[str, Any]:
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+
+        start = time.perf_counter()
+        # 只读底盘轮子速度
+        base_wheel_vel = self.bus.sync_read("Present_Velocity", self.base_motors)
+
+        base_vel = self._wheel_raw_to_body(
+            base_wheel_vel["base_left_wheel"],
+            base_wheel_vel["base_back_wheel"],
+            base_wheel_vel["base_right_wheel"],
+        )
+
+        obs_dict = {**base_vel}
+
+        dt_ms = (time.perf_counter() - start) * 1e3
+        logger.debug(f"{self} read base state: {dt_ms:.1f}ms")
+
+        # 读摄像头
+        for cam_key, cam in self.cameras.items():
+            start = time.perf_counter()
+            obs_dict[cam_key] = cam.async_read()
+            dt_ms = (time.perf_counter() - start) * 1e3
+            logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
+
+        return obs_dict
+
+    # ---------------- 下发动作：只给轮子速度 ---------------- #
+
+    def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
+        """
+        Command base-only LeKiwi to move with a desired body-frame velocity.
+        Expected keys in `action`:
+            - "x.vel", "y.vel", "theta.vel"
+        """
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+
+        base_goal_vel = {k: v for k, v in action.items() if k.endswith(".vel")}
+
+        # 如果 action 里缺字段，可以简单补 0
+        x = base_goal_vel.get("x.vel", 0.0)
+        y = base_goal_vel.get("y.vel", 0.0)
+        theta = base_goal_vel.get("theta.vel", 0.0)
+
+        base_wheel_goal_vel = self._body_to_wheel_raw(x, y, theta)
+
+        # 直接发到底盘三个轮子
+        self.bus.sync_write("Goal_Velocity", base_wheel_goal_vel)
+
+        return {
+            "x.vel": x,
+            "y.vel": y,
+            "theta.vel": theta,
+        }
+    
+    def _from_keyboard_to_base_action(self, keyboard_keys: dict[str, bool]) -> dict[str, float]:
+        """
+        将 KeyboardTeleop 返回的按键状态映射为底盘速度命令 (x/y/theta).
+
+        约定：
+        - 'w' 前进, 's' 后退
+        - 'a' 左移, 'd' 右移
+        - 'z' 左转, 'x' 右转
+        - 'r' 提升速度档位, 'f' 降低速度档位
+        """
+        # 更新速度档位
+        if keyboard_keys.get("r", False):
+            self._speed_mode_idx = min(self._speed_mode_idx + 1, len(self._speed_modes) - 1)
+        if keyboard_keys.get("f", False):
+            self._speed_mode_idx = max(self._speed_mode_idx - 1, 0)
+
+        mode = self._speed_modes[self._speed_mode_idx]
+        lin = mode["lin"]
+        rot = mode["rot"]
+
+        x = 0.0
+        y = 0.0
+        theta = 0.0
+
+        # 平移
+        if keyboard_keys.get("w", False):
+            x += lin
+        if keyboard_keys.get("s", False):
+            x -= lin
+        if keyboard_keys.get("a", False):
+            y += lin
+        if keyboard_keys.get("d", False):
+            y -= lin
+
+        # 旋转
+        if keyboard_keys.get("z", False):
+            theta += rot
+        if keyboard_keys.get("x", False):
+            theta -= rot
+
+        return {
+            "x.vel": x,
+            "y.vel": y,
+            "theta.vel": theta,
+        }
+
