@@ -12,6 +12,8 @@ for cam in [cam_r, cam_l]:
     cam.set(cv2.CAP_PROP_FPS, 15)
     # 尝试设置 MJPG（如果摄像头支持，会大幅降低带宽）
     cam.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+    # 设置缓冲区大小,防止V4L2锁死
+    #cam.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
 print("Right camera opened:", cam_r.isOpened())
 print("Left  camera opened:", cam_l.isOpened())
