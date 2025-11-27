@@ -674,3 +674,268 @@ class LeKiwiBase(LeKiwi):
             "theta.vel": theta,
         }
 
+
+
+
+
+
+class LeKiwiNeck(LeKiwi):
+    """
+    A neck-only version of LeKiwi:
+    - Only two servos are used: neck_yaw and neck_pitch.
+    - No arm / base motors are present on the bus.
+    - Observations and actions only contain joint positions for neck.
+    """
+
+    config_class = LeKiwiConfig
+    name = "lekiwi_neck"
+
+    def __init__(self, config: LeKiwiConfig):
+        # 不要调用 LeKiwi.__init__，只调用 Robot.__init__
+        Robot.__init__(self, config)
+        self.config = config
+
+        norm_mode_body = (
+            MotorNormMode.DEGREES if config.use_degrees else MotorNormMode.RANGE_M100_100
+        )
+
+        # 这里假定物理 ID 已经烧成 10 / 11
+        self.bus = FeetechMotorsBus(
+            port=self.config.port,
+            motors={
+                "neck_yaw":   Motor(10, "sts3215", norm_mode_body),
+                "neck_pitch": Motor(11, "sts3215", norm_mode_body),
+            },
+            calibration=self.calibration,
+        )
+
+        self.arm_motors = []
+        self.base_motors = []
+        self.neck_motors = [motor for motor in self.bus.motors if motor.startswith("neck")]
+
+        # 如果你脖子上有摄像头，这里照常创建；没有摄像头可以改 config 为空
+        #self.cameras = make_cameras_from_configs(config.cameras)
+        self.cameras = {}
+
+    # ---------- 特征定义：只看两个关节 ---------- #
+
+    @property
+    def _state_ft(self) -> dict[str, type]:
+        return dict.fromkeys(
+            (
+                "neck_yaw.pos",
+                "neck_pitch.pos",
+            ),
+            float,
+        )
+
+    @cached_property
+    def observation_features(self) -> dict[str, type | tuple]:
+        # 复用 LeKiwi 的 _cameras_ft
+        return {**self._state_ft, **self._cameras_ft}
+
+    @cached_property
+    def action_features(self) -> dict[str, type]:
+        return self._state_ft
+
+    # ---------- 状态&连接 ---------- #
+
+    @property
+    def is_connected(self) -> bool:
+        return self.bus.is_connected and all(cam.is_connected for cam in self.cameras.values())
+
+    @property
+    def is_calibrated(self) -> bool:
+        return self.bus.is_calibrated
+
+    def connect(self, calibrate: bool = True) -> None:
+        if self.is_connected:
+            raise DeviceAlreadyConnectedError(f"{self} already connected")
+
+        self.bus.connect()
+        if not self.is_calibrated and calibrate:
+            logger.info(
+                "Mismatch between calibration values in the motor and the calibration file "
+                "or no calibration file found"
+            )
+            self.calibrate()
+
+        for cam in self.cameras.values():
+            cam.connect()
+
+        self.configure()
+        logger.info(f"{self} connected.")
+
+    # ---------- 简单校准（可以先用最简单的方式） ---------- #
+
+    #def calibrate(self) -> None:
+    #    """
+    #    Neck-only calibration:
+    #    - If calibration file exists, write it to motors.
+    #    - Otherwise, set homing_offset = 0 and range = [0, 4095].
+    #    """
+    #    if self.calibration:
+    #        user_input = input(
+    #            f"Press ENTER to use provided calibration file associated with the id {self.id}, "
+    #            "or type 'c' and press ENTER to overwrite calibration: "
+    #        )
+    #        if user_input.strip().lower() != "c":
+    #            logger.info(f"Writing calibration file associated with the id {self.id} to the motors")
+    #            self.bus.write_calibration(self.calibration)
+    #            return
+
+    #    logger.info(f"\nRunning neck-only calibration of {self}")
+
+    #    homing_offsets = dict.fromkeys(self.neck_motors, 0)
+    #    range_mins = {}
+    #    range_maxes = {}
+    #    for name, motor in self.bus.motors.items():
+    #        range_mins[name] = 0
+    #        range_maxes[name] = 4095
+
+    #    self.calibration = {}
+    #    for name, motor in self.bus.motors.items():
+    #        self.calibration[name] = MotorCalibration(
+    #            id=motor.id,
+    #            drive_mode=0,
+    #            homing_offset=homing_offsets[name],
+    #            range_min=range_mins[name],
+    #            range_max=range_maxes[name],
+    #        )
+
+    #    self.bus.write_calibration(self.calibration)
+    #    self._save_calibration()
+    #    print("Neck-only calibration saved to", self.calibration_fpath)
+
+
+    def calibrate(self) -> None:
+        """
+        Neck-only interactive calibration:
+
+        步骤：
+          1. 如果已有标定文件，询问是否复用；
+          2. 关闭脖子两个舵机的力矩，切到位置模式；
+          3. 让用户把脖子摆到中间位置，记录为 half-turn homing（0°）；
+          4. 让用户把每个关节在安全范围内来回转动，记录最小/最大 raw 位置；
+          5. 写入 calibration，并保存到文件。
+        """
+        if self.calibration:
+            user_input = input(
+                f"Press ENTER to use provided calibration file associated with the id {self.id}, "
+                "or type 'c' and press ENTER to overwrite calibration: "
+            )
+            if user_input.strip().lower() != "c":
+                logger.info(f"Writing calibration file associated with the id {self.id} to the motors")
+                self.bus.write_calibration(self.calibration)
+                return
+
+        logger.info(f"\nRunning neck-only calibration of {self}")
+
+        # 1) 关闭脖子两个关节的力矩，切为位置模式
+        self.bus.disable_torque(self.neck_motors)
+        for name in self.neck_motors:
+            self.bus.write("Operating_Mode", name, OperatingMode.POSITION.value)
+
+        # 2) 让你把脖子拨到“中间位”
+        input(
+            "Move the neck joints to the MIDDLE of their safe range of motion "
+            "and press ENTER..."
+        )
+        homing_offsets = self.bus.set_half_turn_homings(self.neck_motors)
+
+        # 3) 记录安全范围（不要硬顶到机械止挡）
+        print(
+            "Now, move EACH neck joint by hand sequentially through its entire SAFE range "
+            "(do NOT force it against the hard stop).\n"
+            "Recording positions. Press ENTER to stop..."
+        )
+        range_mins, range_maxes = self.bus.record_ranges_of_motion(self.neck_motors)
+
+        # 4) 组装 calibration
+        self.calibration = {}
+        for name, motor in self.bus.motors.items():
+            self.calibration[name] = MotorCalibration(
+                id=motor.id,
+                drive_mode=0,
+                homing_offset=homing_offsets[name],
+                range_min=range_mins[name],
+                range_max=range_maxes[name],
+            )
+
+        # 5) 写回舵机 & 保存文件
+        self.bus.write_calibration(self.calibration)
+        self._save_calibration()
+        print("Neck-only calibration saved to", self.calibration_fpath)
+
+
+
+
+    # ---------- 配置：脖子关节用位置模式 ---------- #
+
+    def configure(self) -> None:
+        self.bus.disable_torque()
+        self.bus.configure_motors()
+
+        for name in self.neck_motors:
+            self.bus.write("Operating_Mode", name, OperatingMode.POSITION.value)
+            self.bus.write("P_Coefficient", name, 16)
+            self.bus.write("I_Coefficient", name, 0)
+            self.bus.write("D_Coefficient", name, 32)
+
+        self.bus.enable_torque()
+
+    # ---------- 设置 ID：仅脖子两个舵机 ---------- #
+
+    def setup_motors(self) -> None:
+        for motor in reversed(self.neck_motors):
+            input(f"Connect the controller board to the '{motor}' motor only and press enter.")
+            self.bus.setup_motor(motor)
+            print(f"'{motor}' motor id set to {self.bus.motors[motor].id}")
+
+    # ---------- 观测：只读关节角度 + 摄像头 ---------- #
+
+    def get_observation(self) -> dict[str, Any]:
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+
+        start = time.perf_counter()
+        joint_pos = self.bus.sync_read("Present_Position", self.neck_motors)
+        obs_dict = {f"{k}.pos": v for k, v in joint_pos.items()}
+
+        dt_ms = (time.perf_counter() - start) * 1e3
+        logger.debug(f"{self} read neck state: {dt_ms:.1f}ms")
+
+        for cam_key, cam in self.cameras.items():
+            start = time.perf_counter()
+            obs_dict[cam_key] = cam.async_read()
+            dt_ms = (time.perf_counter() - start) * 1e3
+            logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
+
+        return obs_dict
+
+    # ---------- 动作：只控制两个关节位置 ---------- #
+
+    def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+
+        joint_goal = {k: v for k, v in action.items() if k.endswith(".pos")}
+
+        # 不做复杂限幅，直接发
+        raw_goal = {k.replace(".pos", ""): v for k, v in joint_goal.items()}
+        self.bus.sync_write("Goal_Position", raw_goal)
+
+        return joint_goal
+
+    # ---------- 断开 ---------- #
+
+    def disconnect(self) -> None:
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+
+        self.bus.disconnect(self.config.disable_torque_on_disconnect)
+        for cam in self.cameras.values():
+            cam.disconnect()
+
+        logger.info(f"{self} disconnected.")
+

@@ -15,5 +15,5 @@
 # limitations under the License.
 
 from .config_lekiwi import LeKiwiClientConfig, LeKiwiConfig
-from .lekiwi import LeKiwi, LeKiwiBase
+from .lekiwi import LeKiwi, LeKiwiBase, LeKiwiNeck
 from .lekiwi_client import LeKiwiClient
