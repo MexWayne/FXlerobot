@@ -182,7 +182,7 @@ while(True):
 
         # display image
         cv2.imshow('Video_from_right', frame_r)
-        cv2.moveWindow("Video_from_right", 50, 10)
+        #cv2.moveWindow("Video_from_right", 50, 10)
         # press ESC key to exit
         key_r = cv2.waitKey(1)
         if key_r == 27:
@@ -338,7 +338,7 @@ while(True):
 
         # display image
         cv2.imshow('Video_from_left', frame_l)
-        cv2.moveWindow("Video_from_left", 50, 600)
+        #cv2.moveWindow("Video_from_left", 50, 600)
         # press ESC key to exit
         key_l = cv2.waitKey(1)
         if key_l == 27:

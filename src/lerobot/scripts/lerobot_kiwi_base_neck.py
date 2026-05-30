@@ -56,14 +56,14 @@ class StdinKeyboard:
 def main():
     # Base config
     base_cfg = LeKiwiConfig(
-        port="/dev/ttyACM0",
+        port="/dev/ttyACM4",
         id="kiwi_base",
         cameras={},    # 不用相机
     )
 
     # Neck config（用同一个串口）
     neck_cfg = LeKiwiConfig(
-        port="/dev/ttyACM0",
+        port="/dev/ttyACM4",
         id="kiwi_neck",
         cameras={},    # 不用相机
     )
