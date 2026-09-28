@@ -25,6 +25,7 @@ python src/lerobot/async_inference/robot_client.py \
     --policy_type=act \
     --pretrained_name_or_path=user/model \
     --policy_device=mps \
+    --client_device=cpu \
     --actions_per_chunk=50 \
     --chunk_size_threshold=0.5 \
     --aggregate_fn_name=weighted_average \
@@ -46,25 +47,38 @@ import draccus
 import grpc
 import torch
 
-from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
-from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
+from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
+from lerobot.cameras.zmq.configuration_zmq import ZMQCameraConfig  # noqa: F401
+
+# `lerobot.cameras.realsense` imports pyrealsense2 eagerly whenever the package is merely
+# installed, and on some platforms it is installed but not loadable (e.g. a Jetson wheel built
+# against a newer glibc). Probe the dependency itself rather than the camera module, so a missing
+# realsense only costs us that camera type, while any other import error still surfaces.
+try:
+    import pyrealsense2  # noqa: F401
+except ImportError as e:
+    logging.warning("realsense camera type unavailable: pyrealsense2 failed to import (%s)", e)
+else:
+    from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
+
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
-    bi_so100_follower,
+    bi_so_follower,
     koch_follower,
     make_robot_from_config,
-    so100_follower,
-    so101_follower,
+    omx_follower,
+    so_follower,
+    unitree_g1,
 )
 from lerobot.transport import (
     services_pb2,  # type: ignore
     services_pb2_grpc,  # type: ignore
 )
 from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
+from lerobot.utils.import_utils import register_third_party_plugins
 
 from .configs import RobotClientConfig
-from .constants import SUPPORTED_ROBOTS
 from .helpers import (
     Action,
     FPSTracker,
@@ -285,6 +299,21 @@ class RobotClient:
                 timed_actions = pickle.loads(actions_chunk.data)  # nosec
                 deserialize_time = time.perf_counter() - deserialize_start
 
+                # Log device type of received actions
+                if len(timed_actions) > 0:
+                    received_device = timed_actions[0].get_action().device.type
+                    self.logger.debug(f"Received actions on device: {received_device}")
+
+                # Move actions to client_device (e.g., for downstream planners that need GPU)
+                client_device = self.config.client_device
+                if client_device != "cpu":
+                    for timed_action in timed_actions:
+                        if timed_action.get_action().device.type != client_device:
+                            timed_action.action = timed_action.get_action().to(client_device)
+                    self.logger.debug(f"Converted actions to device: {client_device}")
+                else:
+                    self.logger.debug(f"Actions kept on device: {client_device}")
+
                 self.action_chunk_size = max(self.action_chunk_size, len(timed_actions))
 
                 # Calculate network latency if we have matching observations
@@ -469,8 +498,9 @@ class RobotClient:
 def async_client(cfg: RobotClientConfig):
     logging.info(pformat(asdict(cfg)))
 
-    if cfg.robot.type not in SUPPORTED_ROBOTS:
-        raise ValueError(f"Robot {cfg.robot.type} not yet supported!")
+    # TODO: Assert if checking robot support is still needed with the plugin system
+    # if cfg.robot.type not in SUPPORTED_ROBOTS:
+    #     raise ValueError(f"Robot {cfg.robot.type} not yet supported!")
 
     client = RobotClient(cfg)
 
@@ -496,4 +526,5 @@ def async_client(cfg: RobotClientConfig):
 
 
 if __name__ == "__main__":
+    register_third_party_plugins()
     async_client()  # run the client
