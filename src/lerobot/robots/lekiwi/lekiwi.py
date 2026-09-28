@@ -580,13 +580,13 @@ class LeKiwiBase(LeKiwi):
 
     # ---------------- 观测：只读轮子速度 + 摄像头 ---------------- #
 
-    def get_observation(self) -> dict[str, Any]:
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
-
+    @check_if_not_connected
+    def get_observation(self) -> RobotObservation:
         start = time.perf_counter()
         # 只读底盘轮子速度
-        base_wheel_vel = self.bus.sync_read("Present_Velocity", self.base_motors)
+        base_wheel_vel = self.bus.sync_read(
+            "Present_Velocity", self.base_motors, num_retry=self.config.num_read_retries
+        )
 
         base_vel = self._wheel_raw_to_body(
             base_wheel_vel["base_left_wheel"],
@@ -602,7 +602,7 @@ class LeKiwiBase(LeKiwi):
         # 读摄像头
         for cam_key, cam in self.cameras.items():
             start = time.perf_counter()
-            obs_dict[cam_key] = cam.async_read()
+            obs_dict[cam_key] = cam.read_latest()
             dt_ms = (time.perf_counter() - start) * 1e3
             logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
 
@@ -610,15 +610,13 @@ class LeKiwiBase(LeKiwi):
 
     # ---------------- 下发动作：只给轮子速度 ---------------- #
 
-    def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
+    @check_if_not_connected
+    def send_action(self, action: RobotAction) -> RobotAction:
         """
         Command base-only LeKiwi to move with a desired body-frame velocity.
         Expected keys in `action`:
             - "x.vel", "y.vel", "theta.vel"
         """
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
-
         base_goal_vel = {k: v for k, v in action.items() if k.endswith(".vel")}
 
         # 如果 action 里缺字段，可以简单补 0
@@ -757,10 +755,8 @@ class LeKiwiNeck(LeKiwi):
     def is_calibrated(self) -> bool:
         return self.bus.is_calibrated
 
+    @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
-        if self.is_connected:
-            raise DeviceAlreadyConnectedError(f"{self} already connected")
-
         self.bus.connect()
         if not self.is_calibrated and calibrate:
             logger.info(
@@ -903,12 +899,12 @@ class LeKiwiNeck(LeKiwi):
 
     # ---------- 观测：只读关节角度 + 摄像头 ---------- #
 
-    def get_observation(self) -> dict[str, Any]:
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
-
+    @check_if_not_connected
+    def get_observation(self) -> RobotObservation:
         start = time.perf_counter()
-        joint_pos = self.bus.sync_read("Present_Position", self.neck_motors)
+        joint_pos = self.bus.sync_read(
+            "Present_Position", self.neck_motors, num_retry=self.config.num_read_retries
+        )
         obs_dict = {f"{k}.pos": v for k, v in joint_pos.items()}
 
         dt_ms = (time.perf_counter() - start) * 1e3
@@ -916,7 +912,7 @@ class LeKiwiNeck(LeKiwi):
 
         for cam_key, cam in self.cameras.items():
             start = time.perf_counter()
-            obs_dict[cam_key] = cam.async_read()
+            obs_dict[cam_key] = cam.read_latest()
             dt_ms = (time.perf_counter() - start) * 1e3
             logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
 
@@ -924,10 +920,8 @@ class LeKiwiNeck(LeKiwi):
 
     # ---------- 动作：只控制两个关节位置 ---------- #
 
-    def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
-
+    @check_if_not_connected
+    def send_action(self, action: RobotAction) -> RobotAction:
         joint_goal = {k: v for k, v in action.items() if k.endswith(".pos")}
 
         # 不做复杂限幅，直接发
@@ -938,10 +932,8 @@ class LeKiwiNeck(LeKiwi):
 
     # ---------- 断开 ---------- #
 
+    @check_if_not_connected
     def disconnect(self) -> None:
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
-
         self.bus.disconnect(self.config.disable_torque_on_disconnect)
         for cam in self.cameras.values():
             cam.disconnect()
