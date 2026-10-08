@@ -1,7 +1,7 @@
 lerobot-teleoperate \
     --robot.type=so101_follower \
-    --robot.port=/dev/ttyACM2 \
+    --robot.port=/dev/arm_B_follower \
     --robot.id=arm_B_follower \
     --teleop.type=so101_leader \
-    --teleop.port=/dev/ttyACM3 \
+    --teleop.port=/dev/arm_B_leader \
     --teleop.id=arm_B_leader

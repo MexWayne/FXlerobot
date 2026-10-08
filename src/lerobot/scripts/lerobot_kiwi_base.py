@@ -2,7 +2,7 @@
 #from lerobot.robots.lekiwi.config_lekiwi import LeKiwiConfig
 #
 #config = LeKiwiConfig(
-#    port="/dev/ttyACM0",   # 换成你实际的 Feetech USB 口
+#    port="/dev/kiwi_base",   # 换成你实际的 Feetech USB 口
 #    cameras={},            # 先不连摄像头也可以
 #)
 #
@@ -75,7 +75,7 @@ class StdinKeyboard:
 
 def main():
     config = LeKiwiConfig(
-        port="/dev/ttyACM0",  # 换成你的实际串口
+        port="/dev/kiwi_base",  # 换成你的实际串口
         id="kiwi_base",
         cameras={},           # 现在不接相机也没关系
     )
