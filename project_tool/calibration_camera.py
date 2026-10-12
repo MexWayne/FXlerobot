@@ -8,23 +8,24 @@ if not os.environ.get("XAUTHORITY") and os.path.exists(_xauth):
 
 import cv2
 
-#cam_w = cv2.VideoCapture(4)  # /dev/video4
-cam_r = cv2.VideoCapture(0)  # /dev/video2
-cam_l = cv2.VideoCapture(2)  # /dev/video0
+# /dev/videoN moves when USB enumerates; names come from working_sh/99-lerobot-camera.rules.
+LEFT_EYE = "/dev/cam_front_left"
+RIGHT_EYE = "/dev/cam_front_right"
 
-
-# 强制降低分辨率和帧率
-for cam in [cam_r, cam_l]:
+def open_camera(path):
+    cam = cv2.VideoCapture(path, cv2.CAP_V4L2)
+    cam.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     cam.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     cam.set(cv2.CAP_PROP_FPS, 15)
-    # 尝试设置 MJPG（如果摄像头支持，会大幅降低带宽）
-    cam.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-    # 设置缓冲区大小,防止V4L2锁死
-    #cam.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cam.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cam
 
-print("Right camera opened:", cam_r.isOpened())
-print("Left  camera opened:", cam_l.isOpened())
+cam_l = open_camera(LEFT_EYE)
+cam_r = open_camera(RIGHT_EYE)
+
+print("Left  eye opened:", cam_l.isOpened(), os.path.realpath(LEFT_EYE))
+print("Right eye opened:", cam_r.isOpened(), os.path.realpath(RIGHT_EYE))
 
 
 while(True):
@@ -189,6 +190,7 @@ while(True):
         #######################
 
         # display image
+        cv2.putText(frame_r, 'front_right', (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.imshow('Video_from_right', frame_r)
         #cv2.moveWindow("Video_from_right", 50, 10)
         # press ESC key to exit
@@ -345,6 +347,7 @@ while(True):
         #######################
 
         # display image
+        cv2.putText(frame_l, 'front_left', (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.imshow('Video_from_left', frame_l)
         #cv2.moveWindow("Video_from_left", 50, 600)
         # press ESC key to exit
