@@ -13,7 +13,7 @@ def main(cfg: LeKiwiConfig):
 
     用法示例：
         python src/lerobot/scripts/setup_lekiwi_neck_motors.py \
-            --port=/dev/kiwi_base \
+            --port=/dev/base_neck \
             --use_degrees=true
     """
     # 不需要指定 type，LeKiwiConfig 默认 type="lekiwi"

@@ -1,3 +1,11 @@
+import os
+
+if not os.environ.get("DISPLAY"):
+    os.environ["DISPLAY"] = ":0"
+_xauth = "/run/user/%d/gdm/Xauthority" % os.getuid()
+if not os.environ.get("XAUTHORITY") and os.path.exists(_xauth):
+    os.environ["XAUTHORITY"] = _xauth
+
 import cv2
 
 #cam_w = cv2.VideoCapture(4)  # /dev/video4
