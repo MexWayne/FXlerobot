@@ -1,7 +1,7 @@
 REPO_ID=${REPO_ID:-mex_wayne/bimanual_4cam_test}
 TASK=${TASK:-"Grab the black cube"}
 NUM_EPISODES=${NUM_EPISODES:-5}
-DATASET_ROOT=${DATASET_ROOT:-$HOME/workspaces/FXLerobot/datasets/${REPO_ID##*/}}
+DATASET_ROOT=${DATASET_ROOT:-$HOME/workspaces/FXLerobot/FXlerobot/datasets/${REPO_ID##*/}}
 mkdir -p "$(dirname "$DATASET_ROOT")"
 
 DISPLAY_DATA=${DISPLAY_DATA:-true}

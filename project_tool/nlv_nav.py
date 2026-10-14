@@ -31,8 +31,8 @@ import requests
 import validate_head_extrinsic as val
 
 DASHSCOPE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
-LOG_ROOT = os.path.expanduser("~/workspaces/FXLerobot/nav_logs")
-TRACKER_MODEL = os.path.expanduser("~/workspaces/FXLerobot/models/object_tracking_vittrack_2023sep.onnx")
+LOG_ROOT = os.path.expanduser("~/workspaces/FXLerobot/FXlerobot/nav_logs")
+TRACKER_MODEL = os.path.expanduser("~/workspaces/FXLerobot/FXlerobot/models/object_tracking_vittrack_2023sep.onnx")
 EYE = "left"
 MAX_RANGE_M = 3.0
 

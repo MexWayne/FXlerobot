@@ -75,7 +75,7 @@ python wrist_camera_test.py    # 腕部左右，s 对调左右，q / ESC 退出
 
 标定板：ChArUco，5×7 个方格，`DICT_5X5_50`，方格边长 28.2 mm，码边长约 20 mm。这些都是脚本默认值，换板子时用 `--square-mm`、`--marker-mm` 改。
 
-数据和结果保存在 `~/workspaces/FXLerobot/calib/head/`，可用 `--data` 换目录。
+数据和结果保存在 `~/workspaces/FXLerobot/FXlerobot/calib/head/`，可用 `--data` 换目录。
 
 ### 1. 采图
 
@@ -180,7 +180,7 @@ python validate_head_extrinsic.py --headless   # 只打印一次结果
 
 用一句话指定目标，机器人走到头部相机看得见的地面目标跟前（约 3 m 以内）。左眼拍一张图发给通义千问 Qwen-VL，模型返回目标的边界框；之后由 ViT 跟踪器每帧跟住这个框，框的下边中点就是目标贴地处，用 `head_extrinsic.yaml` 换算成底盘坐标下的地面点，每帧据此更新转向和前进速度。全向轮在地毯上打滑、走不直，靠每帧重新计算来纠正。跟丢或每走 5 s，停下重新问一次模型。目标离机器人 0.6 m，或目标底部已到画面下沿（头部相机看到的地面从约 0.52 m 开始）时停止。
 
-跟踪模型放在 `~/workspaces/FXLerobot/models/object_tracking_vittrack_2023sep.onnx`（来自 opencv_zoo）。
+跟踪模型放在 `~/workspaces/FXLerobot/FXlerobot/models/object_tracking_vittrack_2023sep.onnx`（来自 opencv_zoo）。
 
 先在 `~/.bashrc` 里设置 key，再开一个新终端：
 
@@ -211,5 +211,5 @@ python nlv_nav.py "去红色箱子旁边"             # 开始走，Ctrl-C 停�
   ```
 
 - **按键**：这台机器的 OpenCV 用 Qt 显示窗口，只有图像窗口获得焦点时才收得到按键。
-- **旧数据集**：`../../datasets/bimanual_4cam_test` 是在左右改名前录的，里面的 `front_left` 实际是机器人右侧的相机，`front_right` 是左侧的。和新数据混在一起训练前，要先把这两路对调。
+- **旧数据集**：`../datasets/bimanual_4cam_test` 是在左右改名前录的，里面的 `front_left` 实际是机器人右侧的相机，`front_right` 是左侧的。和新数据混在一起训练前，要先把这两路对调。
 - **腕部相机左右**：`cam_wrist_left` 是否真的装在左臂（`/dev/arm_B_follower`）上还没有验证。可以用 `wrist_camera_test.py` 动一下手臂确认。

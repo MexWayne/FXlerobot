@@ -176,3 +176,9 @@ outputs/
 *.urdf
 *.xml
 *.part
+
+# FXlerobot local data: recorded datasets, navigation logs, calibration images, API keys
+datasets/
+nav_logs/
+calib/**/*.png
+working_sh/qwen_key.txt

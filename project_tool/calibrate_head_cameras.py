@@ -30,7 +30,7 @@ import yaml
 CAMS = {"left": "/dev/cam_front_left", "right": "/dev/cam_front_right"}
 WIDTH, HEIGHT = 640, 480
 MIN_CORNERS = 8
-DEFAULT_DATA = os.path.expanduser("~/workspaces/FXLerobot/calib/head")
+DEFAULT_DATA = os.path.expanduser("~/workspaces/FXLerobot/FXlerobot/calib/head")
 
 
 def make_board(square_mm, marker_mm):
