@@ -14,10 +14,11 @@ if [ -z "$DISPLAY" ] || ! xset q >/dev/null 2>&1; then
     DISPLAY_DATA=false
 fi
 
-CAM_FRONT_LEFT=/dev/v4l/by-path/platform-3610000.usb-usb-0:2.2:1.0-video-index0
-CAM_FRONT_RIGHT=/dev/v4l/by-path/platform-3610000.usb-usb-0:2.4:1.0-video-index0
-CAM_WRIST_LEFT=/dev/v4l/by-path/platform-3610000.usb-usb-0:2.3.4:1.0-video-index0
-CAM_WRIST_RIGHT=/dev/v4l/by-path/platform-3610000.usb-usb-0:2.1.3:1.0-video-index0
+# Names come from 99-lerobot-camera.rules (robot's own left/right).
+CAM_FRONT_LEFT=/dev/cam_front_left
+CAM_FRONT_RIGHT=/dev/cam_front_right
+CAM_WRIST_LEFT=/dev/cam_wrist_left
+CAM_WRIST_RIGHT=/dev/cam_wrist_right
 
 # Wrist cams drop to ~8-15 fps in low light unless this is off.
 for cam in "$CAM_WRIST_LEFT" "$CAM_WRIST_RIGHT"; do
