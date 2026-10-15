@@ -90,6 +90,7 @@ lerobot-record \\
 """
 
 import logging
+import math
 import time
 from dataclasses import asdict, dataclass
 from pprint import pformat
@@ -246,6 +247,7 @@ def record_loop(
     display_mode: str = "rerun",
     display_compressed_images: bool = False,
     timer: CycleTimer | None = None,
+    countdown: str | None = None,
 ):
     """Drive the robot from the teleoperator at *fps*, optionally recording each frame.
 
@@ -289,6 +291,7 @@ def record_loop(
 
     no_action_count = 0
     timestamp = 0
+    last_announced = None
     start_episode_t = time.perf_counter()
     while timestamp < control_time_s:
         # Checked before `tick()`: this iteration is not a control tick, so it should not
@@ -296,6 +299,12 @@ def record_loop(
         if events["exit_early"]:
             events["exit_early"] = False
             break
+
+        if countdown is not None:
+            remaining = math.ceil(control_time_s - timestamp)
+            if remaining != last_announced and (remaining <= 5 or remaining % 10 == 0):
+                print(countdown.format(remaining=remaining), flush=True)
+                last_announced = remaining
 
         timer.tick()
 
@@ -491,9 +500,38 @@ def record(
             )
 
         with VideoEncodingManager(dataset):
+            print(
+                f"----- 首段准备 {cfg.dataset.reset_time_s} s：调整机器人和场景（不录制），"
+                "n/→ 提前结束准备 -----",
+                flush=True,
+            )
+            log_say("Prepare for the first episode", cfg.play_sounds)
+            record_loop(
+                robot=robot,
+                events=events,
+                fps=cfg.dataset.fps,
+                teleop_action_processor=teleop_action_processor,
+                robot_action_processor=robot_action_processor,
+                robot_observation_processor=robot_observation_processor,
+                teleop=teleop,
+                control_time_s=cfg.dataset.reset_time_s,
+                single_task=cfg.dataset.single_task,
+                display_data=cfg.display_data,
+                display_mode=cfg.display_mode,
+                countdown="  [首段准备] 还剩 {remaining} s 开始第 1 段录制",
+            )
+
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 episode_index = dataset.num_episodes
+                n_done, n_total = recorded_episodes + 1, cfg.dataset.num_episodes
+                is_last = recorded_episodes == n_total - 1
+                after_record = "停止录制并落盘（最后一段）" if is_last else f"停止录制，进入 {cfg.dataset.reset_time_s} s 复位"
+                print(
+                    f"\n===== 开始录制第 {n_done}/{n_total} 段（episode {episode_index}），最长 "
+                    f"{cfg.dataset.episode_time_s} s。n/→ 提前结束本段，r/← 重录，q/Esc 结束采集 =====",
+                    flush=True,
+                )
                 log_say(f"Recording episode {episode_index}", cfg.play_sounds)
                 record_loop(
                     robot=robot,
@@ -510,13 +548,19 @@ def record(
                     display_mode=cfg.display_mode,
                     display_compressed_images=display_compressed_images,
                     timer=timer,
+                    countdown=f"  [录制 {n_done}/{n_total}] 还剩 {{remaining}} s {after_record}",
                 )
+                print(f"===== 第 {n_done}/{n_total} 段录制结束 =====", flush=True)
 
                 # Execute a few seconds without recording to give time to manually reset the environment
                 # Skip reset for the last episode to be recorded
                 if not events["stop_recording"] and (
                     (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
                 ):
+                    print(
+                        f"----- 复位 {cfg.dataset.reset_time_s} s：把场景放回初始状态（不录制），n/→ 提前结束复位 -----",
+                        flush=True,
+                    )
                     log_say("Reset the environment", cfg.play_sounds)
 
                     record_loop(
@@ -531,9 +575,11 @@ def record(
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
                         display_mode=cfg.display_mode,
+                        countdown=f"  [复位] 还剩 {{remaining}} s 落盘第 {n_done} 段，然后开始下一段录制",
                     )
 
                 if events["rerecord_episode"]:
+                    print(f"===== 第 {n_done}/{n_total} 段已丢弃，重新录制这一段 =====", flush=True)
                     log_say("Re-record episode", cfg.play_sounds)
                     events["rerecord_episode"] = False
                     events["exit_early"] = False
@@ -542,8 +588,20 @@ def record(
                     timer.restart()
                     continue
 
+                print(f"===== 正在落盘第 {n_done}/{n_total} 段，期间不要关闭程序 =====", flush=True)
+                save_t0 = time.perf_counter()
                 dataset.save_episode()
                 recorded_episodes += 1
+                next_step = (
+                    "马上开始下一段录制"
+                    if recorded_episodes < n_total and not events["stop_recording"]
+                    else "全部录制完成"
+                )
+                print(
+                    f"===== 第 {n_done}/{n_total} 段已落盘，用时 {time.perf_counter() - save_t0:.1f} s，"
+                    f"数据集共 {dataset.num_episodes} 段；{next_step} =====",
+                    flush=True,
+                )
                 # Close the window on the episode just saved.  The digest is emitted on
                 # the next episode's first tick, so the reset phase, `save_episode` and
                 # the spoken prompts in between are excluded from the cadence instead of

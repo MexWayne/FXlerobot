@@ -119,9 +119,13 @@ def pynput_can_capture() -> bool:
       :func:`pynput_listener_is_trusted`.
     * Windows: ``True`` (the low-level global hook needs no special permission).
 
-    Always ``False`` when ``pynput`` is not installed.
+    Always ``False`` when ``pynput`` is not installed, or when
+    ``LEROBOT_KEYBOARD_BACKEND=terminal`` forces terminal input (e.g. over SSH while
+    ``DISPLAY`` points at the robot's own screen for the viewer).
     """
     if not _pynput_available:
+        return False
+    if os.environ.get("LEROBOT_KEYBOARD_BACKEND", "").lower() == "terminal":
         return False
     if platform.system() == "Linux":
         return not is_headless() and not is_wayland()

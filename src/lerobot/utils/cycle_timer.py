@@ -404,7 +404,9 @@ class CycleTimer:
                         if self.records_data
                         else "Robot control might be unstable."
                     )
-                    logger.warning(
+                    # This can happen repeatedly during recording; keep it available for
+                    # diagnostics without flooding the operator terminal.
+                    logger.debug(
                         f"Control loop is running slower ({1 / group_work:.1f} Hz) than the target FPS "
                         f"({self.fps:g} Hz). {consequence} Common causes are: 1) Camera FPS not keeping up "
                         "2) Policy inference (action or text) taking too long 3) CPU starvation"
