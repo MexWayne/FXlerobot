@@ -29,7 +29,34 @@ def assert_port_ready(port: str) -> None:
             f"串口已被占用: {port} -> {real} (PID {users})\n"
             f"先结束旧进程:  pkill -f lerobot_kiwi  或  fuser -k {real}"
         )
+    check_bus_alive(real)
     log(f"串口就绪: {port} -> {real}")
+
+
+def check_bus_alive(real: str, ids=(7, 8, 9, 10, 11)) -> None:
+    """Ping the servos with a write timeout; LeRobot's own handshake blocks forever on a hung USB adapter."""
+    import serial
+    import scservo_sdk as scs
+
+    port = scs.PortHandler(real)
+    if not port.openPort():
+        raise SystemExit(f"串口打不开: {real}")
+    try:
+        port.ser.write_timeout = 0.5
+        ph = scs.PacketHandler(0)
+        answered = [i for i in ids if ph.ping(port, i)[1] == scs.COMM_SUCCESS]
+    except serial.SerialTimeoutException:
+        raise SystemExit(
+            f"串口写入超时: {real}，底盘/脖子的 USB 串口板不收数据（芯片死机）。\n"
+            "拔插这块板子的 USB 线；还不行就断开舵机电源 5 秒再上电。"
+        )
+    finally:
+        port.closePort()
+    if not answered:
+        raise SystemExit(f"舵机 {list(ids)} 都没有应答: {real}，检查底盘/脖子舵机电源和串联线")
+    missing = [i for i in ids if i not in answered]
+    if missing:
+        log(f"警告: 舵机 {missing} 没有应答，后面连接可能失败")
 
 
 class StdinKeyboard:

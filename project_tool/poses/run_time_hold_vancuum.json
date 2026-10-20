@@ -1,0 +1,22 @@
+{
+  "name": "run_time_hold_vancuum",
+  "saved_at": "2026-10-20T13:06:43",
+  "arms": {
+    "left": {
+      "shoulder_pan": 2045,
+      "shoulder_lift": 818,
+      "elbow_flex": 3275,
+      "wrist_flex": 2922,
+      "wrist_roll": 2003,
+      "gripper": 1354
+    },
+    "right": {
+      "shoulder_pan": 1665,
+      "shoulder_lift": 803,
+      "elbow_flex": 1384,
+      "wrist_flex": 3097,
+      "wrist_roll": 2034,
+      "gripper": 738
+    }
+  }
+}
