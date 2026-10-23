@@ -161,6 +161,10 @@ class SOFollower(Robot):
             self.bus.configure_motors()
             for motor in self.bus.motors:
                 self.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
+                # Clear motion-profile limits left by tools such as save_pose.py so teleoperation
+                # tracks the leader at the servo's normal speed (0 means unlimited in position mode).
+                self.bus.write("Goal_Time", motor, 0)
+                self.bus.write("Goal_Velocity", motor, 0)
                 self.bus.write("P_Coefficient", motor, self.config.position_p_coefficient)
                 self.bus.write("I_Coefficient", motor, self.config.position_i_coefficient)
                 self.bus.write("D_Coefficient", motor, self.config.position_d_coefficient)
