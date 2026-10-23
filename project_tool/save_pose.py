@@ -1,12 +1,13 @@
 #!/usr/bin/env python
-"""Save the two follower arms under a name, or move them back to that pose.
+"""Save the two follower arms and neck under a name, or restore that pose.
 
     python save_pose.py save home
     python save_pose.py restore home
 
-Left is /dev/arm_B_follower, right is /dev/arm_A_follower. Leader arms are not
-opened. Both commands print each servo's angle. save only reads. restore turns
-torque on and leaves it on; release_arms.py lets go.
+Left is /dev/arm_B_follower, right is /dev/arm_A_follower, and the neck uses
+IDs 10/11 on /dev/base_neck. Wheel IDs 7/8/9 are never accessed. New poses
+include the neck; old arm-only pose files remain restorable. save only reads.
+restore leaves torque on; release it with release_arms.py --include-neck.
 """
 
 import json
@@ -29,7 +30,12 @@ CALIBRATION = {
     "right": Path.home()
     / ".cache/huggingface/lerobot/calibration/robots/so_follower/bimanual_follower_right.json",
 }
+NECK_PORT = "/dev/base_neck"
+NECK_CALIBRATION = (
+    Path.home() / ".cache/huggingface/lerobot/calibration/robots/lekiwi_neck/kiwi_neck.json"
+)
 MOTORS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
+NECK_MOTORS = {10: "neck_yaw", 11: "neck_pitch"}
 POSE_DIR = Path(__file__).resolve().parent / "poses"
 BAUDRATE = 1_000_000
 FULL_TURN = 4095
@@ -38,6 +44,7 @@ REG = {
     "Torque_Enable": (40, 1),
     "Acceleration": (41, 1),
     "Goal_Position": (42, 2),
+    "Goal_Time": (44, 2),
     "Goal_Velocity": (46, 2),
     "Lock": (55, 1),
     "Present_Position": (56, 2),
@@ -116,6 +123,20 @@ def print_angles(arms):
             print(f"  {name:13s} {angle:8.2f}°")
 
 
+def load_neck_calibration():
+    if not NECK_CALIBRATION.is_file():
+        raise RuntimeError(f"没有 neck 标定文件 {NECK_CALIBRATION}")
+    return json.loads(NECK_CALIBRATION.read_text())
+
+
+def print_neck(neck):
+    calibration = load_neck_calibration()
+    print(f"neck  {NECK_PORT}")
+    for name in NECK_MOTORS.values():
+        angle = degrees(neck[name], calibration[name])
+        print(f"  {name:13s} {angle:8.2f}°")
+
+
 def open_arms():
     buses = {}
     try:
@@ -134,6 +155,16 @@ def open_arms():
         raise
 
 
+def open_neck():
+    if not os.path.exists(NECK_PORT):
+        raise RuntimeError(f"{NECK_PORT} 不存在，先看 ls -l /dev/base_neck")
+    holders = port_holders(NECK_PORT)
+    if holders:
+        lines = "\n".join(f"    PID {pid}: {cmd[:120]}" for pid, cmd in holders)
+        raise RuntimeError(f"{NECK_PORT} 被其他进程占用，先停掉它:\n{lines}")
+    return Servos(NECK_PORT)
+
+
 def read_positions(buses):
     arms = {}
     for side, bus in buses.items():
@@ -146,6 +177,16 @@ def read_positions(buses):
     return arms
 
 
+def read_neck(bus):
+    neck = {}
+    for sid, name in NECK_MOTORS.items():
+        ticks = bus.read(sid, "Present_Position")
+        if ticks is None:
+            raise RuntimeError(f"{NECK_PORT} 的 {name} (ID {sid}) 没有读到位置")
+        neck[name] = int(ticks)
+    return neck
+
+
 def pose_path(pose_name):
     if not pose_name or pose_name in (".", "..") or any(c in pose_name for c in "/\\"):
         raise SystemExit("姿势名不能为空，也不能包含 / 或 \\")
@@ -154,9 +195,14 @@ def pose_path(pose_name):
 
 def save_pose(pose_name):
     buses = open_arms()
+    neck_bus = None
     try:
+        neck_bus = open_neck()
         arms = read_positions(buses)
+        neck = read_neck(neck_bus)
     finally:
+        if neck_bus is not None:
+            neck_bus.close()
         for bus in buses.values():
             bus.close()
     path = pose_path(pose_name)
@@ -167,6 +213,7 @@ def save_pose(pose_name):
                 "name": pose_name,
                 "saved_at": datetime.now().isoformat(timespec="seconds"),
                 "arms": arms,
+                "neck": neck,
             },
             indent=2,
             ensure_ascii=False,
@@ -175,6 +222,7 @@ def save_pose(pose_name):
     )
     print(pose_name)
     print_angles(arms)
+    print_neck(neck)
 
 
 def _step_towards(commanded, target, max_step):
@@ -188,7 +236,10 @@ def restore_pose(pose_name):
     path = pose_path(pose_name)
     if not path.is_file():
         raise SystemExit(f"没有这个姿势: {pose_name}")
-    saved = json.loads(path.read_text())["arms"]
+    pose = json.loads(path.read_text())
+    saved = pose["arms"]
+    saved_neck = pose.get("neck")
+
     for side in ARMS:
         for name in MOTORS:
             ticks = int(saved[side][name])
@@ -196,8 +247,24 @@ def restore_pose(pose_name):
                 raise SystemExit(f"{side} {name} 的刻度 {ticks} 超出 0..{FULL_TURN}")
             saved[side][name] = ticks
 
+    if saved_neck is not None:
+        neck_calibration = load_neck_calibration()
+        for name in NECK_MOTORS.values():
+            ticks = int(saved_neck[name])
+            range_min = int(neck_calibration[name]["range_min"])
+            range_max = int(neck_calibration[name]["range_max"])
+            if not range_min <= ticks <= range_max:
+                raise SystemExit(
+                    f"neck {name} 的刻度 {ticks} 超出标定范围 {range_min}..{range_max}"
+                )
+            saved_neck[name] = ticks
+
     buses = open_arms()
+    neck_bus = None
     try:
+        if saved_neck is not None:
+            neck_bus = open_neck()
+
         present = {}
         for side, bus in buses.items():
             present[side] = {}
@@ -210,13 +277,29 @@ def restore_pose(pose_name):
                     raise RuntimeError(f"{ARMS[side]} {name} 没有读到当前位置，没有改力矩")
                 present[side][name] = int(ticks)
 
+        present_neck = None
+        if neck_bus is not None:
+            present_neck = {}
+            for sid, name in NECK_MOTORS.items():
+                mode = neck_bus.read(sid, "Operating_Mode")
+                if mode != POSITION_MODE:
+                    raise RuntimeError(f"{NECK_PORT} {name} 不在位置模式，没有改力矩")
+                ticks = neck_bus.read(sid, "Present_Position")
+                if ticks is None:
+                    raise RuntimeError(f"{NECK_PORT} {name} 没有读到当前位置，没有改力矩")
+                present_neck[name] = int(ticks)
+
         speed_ticks = SPEED_DEG * FULL_TURN / 360.0
         max_step = max(1, int(round(speed_ticks / CONTROL_HZ)))
         goal_velocity = max(1, min(3400, int(round(speed_ticks * 1.3))))
-        farthest = max(
+        distances = [
             abs(saved[side][name] - present[side][name]) for side in ARMS for name in MOTORS
-        )
-        deadline = time.monotonic() + farthest / speed_ticks * 1.8 + 2.0
+        ]
+        if saved_neck is not None:
+            distances.extend(
+                abs(saved_neck[name] - present_neck[name]) for name in NECK_MOTORS.values()
+            )
+        deadline = time.monotonic() + max(distances) / speed_ticks * 1.8 + 2.0
 
         for side, bus in buses.items():
             for sid, name in enumerate(MOTORS, start=1):
@@ -227,7 +310,17 @@ def restore_pose(pose_name):
                 if not bus.write(sid, "Torque_Enable", 1) or not bus.write(sid, "Lock", 1):
                     raise RuntimeError(f"{ARMS[side]} {name} 打不开力矩")
 
+        if neck_bus is not None:
+            for sid, name in NECK_MOTORS.items():
+                if not neck_bus.write(sid, "Goal_Position", present_neck[name]):
+                    raise RuntimeError(f"{NECK_PORT} {name} 写当前位置失败，没有打开力矩")
+                neck_bus.write(sid, "Acceleration", 40)
+                neck_bus.write(sid, "Goal_Velocity", goal_velocity)
+                if not neck_bus.write(sid, "Torque_Enable", 1) or not neck_bus.write(sid, "Lock", 1):
+                    raise RuntimeError(f"{NECK_PORT} {name} 打不开力矩")
+
         commanded = {side: dict(positions) for side, positions in present.items()}
+        commanded_neck = dict(present_neck) if present_neck is not None else None
         period = 1.0 / CONTROL_HZ
         try:
             while True:
@@ -241,6 +334,14 @@ def restore_pose(pose_name):
                             arrived = False
                         if not bus.write(sid, "Goal_Position", nxt):
                             raise RuntimeError(f"{ARMS[side]} {name} 写目标失败，力矩仍开着")
+                if neck_bus is not None:
+                    for sid, name in NECK_MOTORS.items():
+                        nxt = _step_towards(commanded_neck[name], saved_neck[name], max_step)
+                        commanded_neck[name] = nxt
+                        if nxt != saved_neck[name]:
+                            arrived = False
+                        if not neck_bus.write(sid, "Goal_Position", nxt):
+                            raise RuntimeError(f"{NECK_PORT} {name} 写目标失败，力矩仍开着")
                 if arrived or time.monotonic() >= deadline:
                     break
                 time.sleep(max(0.0, period - (time.monotonic() - started)))
@@ -250,9 +351,16 @@ def restore_pose(pose_name):
                     here = bus.read(sid, "Present_Position")
                     if here is not None:
                         bus.write(sid, "Goal_Position", here)
+            if neck_bus is not None:
+                for sid, name in NECK_MOTORS.items():
+                    here = neck_bus.read(sid, "Present_Position")
+                    if here is not None:
+                        neck_bus.write(sid, "Goal_Position", here)
             print()
             print(pose_name)
             print_angles(read_positions(buses))
+            if neck_bus is not None:
+                print_neck(read_neck(neck_bus))
             raise SystemExit(130)
 
         settle_until = time.monotonic() + 2.0
@@ -263,12 +371,34 @@ def restore_pose(pose_name):
                 for side in ARMS
                 for name in MOTORS
             )
+            if neck_bus is not None:
+                now_neck = read_neck(neck_bus)
+                pending = pending or any(
+                    abs(now_neck[name] - saved_neck[name]) > ARRIVE_TICKS
+                    for name in NECK_MOTORS.values()
+                )
             if not pending:
                 break
             time.sleep(0.05)
         print(pose_name)
         print_angles(read_positions(buses))
+        if neck_bus is not None:
+            print_neck(read_neck(neck_bus))
+        else:
+            print("旧姿势文件没有 neck 数据，仅恢复双臂")
     finally:
+        # Do not leak the slow restore profile into subsequent teleoperation.
+        for bus in buses.values():
+            for sid in range(1, len(MOTORS) + 1):
+                bus.write(sid, "Acceleration", 254)
+                bus.write(sid, "Goal_Time", 0)
+                bus.write(sid, "Goal_Velocity", 0)
+        if neck_bus is not None:
+            for sid in NECK_MOTORS:
+                neck_bus.write(sid, "Acceleration", 254)
+                neck_bus.write(sid, "Goal_Time", 0)
+                neck_bus.write(sid, "Goal_Velocity", 0)
+            neck_bus.close()
         for bus in buses.values():
             bus.close()
 

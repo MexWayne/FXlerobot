@@ -13,6 +13,7 @@ Usage:
     python release_arms.py                 # all four arms, asks before releasing
     python release_arms.py --yes           # no prompt
     python release_arms.py --ports /dev/arm_A_follower
+    python release_arms.py --include-neck  # release all four arms plus neck IDs 10/11
     python release_arms.py --check         # only read status, don't touch torque
 """
 
@@ -25,7 +26,12 @@ import time
 import scservo_sdk as scs
 
 DEFAULT_PORTS = ["/dev/arm_A_follower", "/dev/arm_B_follower", "/dev/arm_A_leader", "/dev/arm_B_leader"]
-MOTORS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
+NECK_PORT = "/dev/base_neck"
+ARM_MOTORS = [(i, name) for i, name in enumerate(
+    ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"],
+    start=1,
+)]
+NECK_MOTORS = [(10, "neck_yaw"), (11, "neck_pitch")]
 BAUDRATE = 1_000_000
 # STS3215 control table: name -> (address, bytes).
 REG = {
@@ -71,6 +77,9 @@ class Servos:
         self.pk = scs.PacketHandler(0)
         if not self.port.openPort() or not self.port.setBaudRate(BAUDRATE):
             raise OSError("openPort/setBaudRate failed")
+        # Avoid hanging forever when a USB serial adapter stops accepting writes.
+        if getattr(self.port, "ser", None) is not None:
+            self.port.ser.write_timeout = 0.5
 
     def close(self):
         self.port.closePort()
@@ -102,6 +111,17 @@ class Servos:
         return False
 
 
+def motors_for_port(port):
+    if port == NECK_PORT:
+        return NECK_MOTORS
+    try:
+        if os.path.exists(port) and os.path.exists(NECK_PORT) and os.path.samefile(port, NECK_PORT):
+            return NECK_MOTORS
+    except OSError:
+        pass
+    return ARM_MOTORS
+
+
 def handle_port(port, check_only):
     print(f"\n===== {port} -> {os.path.realpath(port)} =====")
     if not os.path.exists(port):
@@ -121,7 +141,7 @@ def handle_port(port, check_only):
 
     ok = True
     try:
-        for sid, name in enumerate(MOTORS, start=1):
+        for sid, name in motors_for_port(port):
             alive, err = bus.ping(sid)
             if not alive:
                 print(f"  [{name:13s}] 完全无响应：检查舵机供电/线缆，或断电 5 秒再上电")
@@ -168,16 +188,20 @@ def main():
     ap.add_argument("--ports", nargs="+", default=DEFAULT_PORTS)
     ap.add_argument("--check", action="store_true", help="only read status, don't disable torque")
     ap.add_argument("--yes", "-y", action="store_true", help="skip the confirmation prompt")
+    ap.add_argument("--include-neck", action="store_true", help="also release neck IDs 10/11")
     args = ap.parse_args()
+    ports = list(args.ports)
+    if args.include_neck and NECK_PORT not in ports:
+        ports.append(NECK_PORT)
 
     if not args.check and not args.yes:
         print("将关闭以下机械臂所有舵机的力矩，从臂会因重力下落，请先用手托住：")
-        for p in args.ports:
+        for p in ports:
             print(f"  {p}")
         if input("托好后按回车继续（输入 n 取消）: ").strip().lower() == "n":
             sys.exit("已取消")
 
-    results = {p: handle_port(p, args.check) for p in args.ports}
+    results = {p: handle_port(p, args.check) for p in ports}
 
     print("\n===== 汇总 =====")
     for p, ok in results.items():

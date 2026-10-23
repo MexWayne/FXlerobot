@@ -22,7 +22,7 @@ cd ~/workspaces/FXLerobot/FXlerobot/project_tool
 | `calibrate_head_cameras.py` | 头部双目 ChArUco 标定：内参、双目外参、相机到底盘外参 |
 | `validate_head_extrinsic.py` | 校验相机到底盘的外参：双目一致性、竖放板子检查、地面网格叠加和点击测距 |
 | `nlv_nav.py` | 短距离语言导航：通义千问看头部画面找目标，底盘走到目标跟前 |
-| `save_pose.py` | 记录两只从臂的当前关节位置，之后读回来恢复到这个姿势 |
+| `save_pose.py` | 记录两只从臂和 neck 的当前关节位置，之后读回来恢复到这个姿势 |
 
 ## 设备名
 
@@ -215,13 +215,13 @@ python nlv_nav.py "去红色箱子旁边"             # 开始走，Ctrl-C 停�
 - **旧数据集**：`../datasets/bimanual_4cam_test` 是在左右改名前录的，里面的 `front_left` 实际是机器人右侧的相机，`front_right` 是左侧的。和新数据混在一起训练前，要先把这两路对调。
 - **腕部相机左右**：`cam_wrist_left` 是否真的装在左臂（`/dev/arm_B_follower`）上还没有验证。可以用 `wrist_camera_test.py` 动一下手臂确认。
 
-## 保存和恢复手臂姿势 `save_pose.py`
+## 保存和恢复双臂与 neck 姿势 `save_pose.py`
 
-只动两只从臂：左臂 `/dev/arm_B_follower`，右臂 `/dev/arm_A_follower`。名字自定，保存和还原用同一个。
+记录和恢复左臂 `/dev/arm_B_follower`、右臂 `/dev/arm_A_follower`，以及 `/dev/base_neck` 上的 neck yaw/pitch（ID 10/11）。不会访问同总线上的轮子 ID 7/8/9。名字自定，保存和还原用同一个；旧的双臂姿势文件仍可恢复。
 
 ```bash
 python save_pose.py save home       # 保存当前姿势，并打印每个舵机的角度
 python save_pose.py restore home    # 回到这个姿势，并打印每个舵机的角度
 ```
 
-`save` 不改力矩。`restore` 到位后力矩保持打开，要松开就跑 `python release_arms.py`。
+`save` 不改力矩。`restore` 到位后双臂和 neck 力矩保持打开，要全部松开就跑 `python release_arms.py --include-neck`。
