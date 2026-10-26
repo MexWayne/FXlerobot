@@ -9,10 +9,11 @@
 
 状态页：浏览器打开 http://<jetson>:8765 。Ctrl-C 停车。
 
-流程：不先转圈测围栏，也不先开到墙角。车朝哪就从哪开始固定 S 形，行距 30 cm，每行往右边换。
-每一行笔直向前，每 --check-m 米看一次：看到的围栏或踢脚线就换行；其他东西就是障碍，侧移绕开，
-开到它背后，再回到原来这一行，然后把背后剩下的路笔直走到围栏。两边都绕不过才结束这一行。不做补扫。
-状态页上的图随车走出来：扫过的地面、障碍，以及看到的踢脚线和围栏。一开始只有车身边的一小块。
+流程：1) 原地用激光雷达转一圈，定出场地的大体范围（车身不用转）。范围内凸出来的是物体，
+先标上。玻璃和镜子这一步是不准的，雷达会照镜或者穿过去。2) 在这个范围里走固定 S 形，行距 30 cm。
+每一行笔直向前，每 --check-m 米用 VLN 看一次：玻璃、镜子、踢脚线按视觉把边界改到实处，其他物体用
+雷达测距，近了就绕开，开到它背后，再回到原来这一行，把背后走到围栏。两边都绕不过才结束这一行。
+不做补扫。状态页随车更新。
 """
 
 import argparse
@@ -444,6 +445,27 @@ class FakeHead:
         return ("hit", c[0], c[1], label, pts)
 
 
+def lidar_map(mover, view, lidar):
+    """Grid for the area one lidar turn can see. Objects inside that outline are marked."""
+    outline, objects = lidar.extent()
+    poly = [list(cr.to_map(mover, x, y)) for x, y in outline]
+    xs, ys = [p[0] for p in poly], [p[1] for p in poly]
+    print(f"雷达看了一圈：大约 {max(xs) - min(xs):.1f} m × {max(ys) - min(ys):.1f} m，"
+          f"里面有 {len(objects)} 处比墙更近的物体")
+    print("玻璃和镜子这一圈不准，遍历时用视觉再判断")
+    cmap = cr.make_map(poly, mover)
+    here = (mover.x, mover.y)
+    marked = []
+    for x, y in objects:
+        mx, my = cr.to_map(mover, x, y)
+        if cr._inside_xy(mx, my, cmap):
+            cmap.block(mx, my, 0.08, protect_xy=here)
+            marked.append((mx, my))
+    with view.lock:
+        view.scan_points = poly[::3] + marked
+    return cmap
+
+
 def growing_map(mover):
     """A wide grid whose fence starts at the body and is drawn out by driving and by walls seen later."""
     half = 6.0
@@ -489,12 +511,37 @@ def work(args, view, robot):
             mover.attach_imu(imu)
         else:
             print("没有用 IMU：转角和直线只靠速度×时间，不准")
-        boundary = None
-    cmap = cr.make_map(boundary, mover) if boundary is not None else growing_map(mover)
+        mover.lidar = None
+        lidar = None
+        try:
+            from lidar_scan import Lidar
+
+            lidar = Lidar()
+            lidar.start()
+            mover.lidar = lidar
+            robot["lidar"] = lidar
+            print(f"雷达：{lidar.port}")
+        except Exception as err:
+            print(f"雷达没打开（{err}），范围和距离只用视觉")
+            if lidar is not None:
+                lidar.close()
+            lidar = None
+            mover.lidar = None
+        if lidar is not None:
+            mover.show("雷达看场地范围")
+            try:
+                cmap = lidar_map(mover, view, lidar)
+            except Exception as err:
+                print(f"雷达没测出范围（{err}），边走边画")
+                cmap = growing_map(mover)
+        else:
+            cmap = growing_map(mover)
+    if args.dry_run:
+        cmap = cr.make_map(boundary, mover)
     mover.cmap = cmap
     view.set_map(cmap)
     robot["cmap"] = cmap
-    print(f"不先扫描，从当前朝向开始 S 形，每 {args.check_m:.2f} m 看一次前方")
+    print(f"范围定了，开始 S 形，每 {args.check_m:.2f} m 用视觉看一次前方")
     mover.show("S 形直行")
     result = sweep(mover, head, cmap, args.check_m)
     print(f"已清扫约 {cmap.stats()['sweep'] * 100:.0f}% 的可扫地面")
@@ -528,7 +575,7 @@ def main():
     writer = view.start_writer(cr.MAP_DIR)
     print(f"状态页：http://{cr.local_ip()}:{args.port}")
 
-    robot = {"head": None, "base": None, "imu": None, "cmap": view.cmap}
+    robot = {"head": None, "base": None, "imu": None, "lidar": None, "cmap": view.cmap}
     try:
         work(args, view, robot)
     except SystemExit as stop:
@@ -547,6 +594,8 @@ def main():
             robot["head"].close()
         if robot["imu"] is not None:
             robot["imu"].close()
+        if robot["lidar"] is not None:
+            robot["lidar"].close()
         writer.set()
         view.write(cr.MAP_DIR, running=False)
         print(f"底盘已停。状态页仍开着：http://{cr.local_ip()}:{args.port}")

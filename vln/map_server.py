@@ -73,7 +73,8 @@ class Cache:
         running = bool(st.get("running")) and time.time() - updated < STALE_S
         when = time.strftime("%m-%d %H:%M:%S", time.localtime(updated))
         status = st["status"] if running else f"程序没在运行 · 上次：{st['status']}"
-        return {"status": status, "running": running, "when": f"更新于 {when}", "has_map": st.get("has_map", False),
+        return {"status": status, "stage": st.get("stage", ""), "running": running,
+                "when": f"更新于 {when}", "has_map": st.get("has_map", False),
                 "sweep": st.get("sweep", 0.0), "furniture": st.get("furniture", []), "version": version}
 
 

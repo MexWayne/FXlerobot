@@ -111,12 +111,57 @@ def clip_polygon(poly, point, normal):
 
 
 class CleanMap:
+    def ensure_room(self, poly, pad=None):
+        """Grow the grid when `poly` no longer fits. Old cells stay on the same world positions."""
+        if pad is None:
+            pad = self.robot_radius + self.body_brush
+        xs = [float(p[0]) for p in poly]
+        ys = [float(p[1]) for p in poly]
+        want_x0, want_y0 = min(xs) - pad, min(ys) - pad
+        want_x1, want_y1 = max(xs) + pad, max(ys) + pad
+        cur_x1 = self.origin[0] + self.w * self.res
+        cur_y1 = self.origin[1] + self.h * self.res
+        if (want_x0 >= self.origin[0] - 1e-6 and want_y0 >= self.origin[1] - 1e-6
+                and want_x1 <= cur_x1 + 1e-6 and want_y1 <= cur_y1 + 1e-6):
+            return False
+        ox = int(math.floor((self.origin[0] - min(self.origin[0], want_x0)) / self.res + 1e-6))
+        oy = int(math.floor((self.origin[1] - min(self.origin[1], want_y0)) / self.res + 1e-6))
+        origin = (self.origin[0] - ox * self.res, self.origin[1] - oy * self.res)
+        far_x = max(cur_x1, want_x1)
+        far_y = max(cur_y1, want_y1)
+        w = max(ox + self.w, int(math.ceil((far_x - origin[0]) / self.res - 1e-6)))
+        h = max(oy + self.h, int(math.ceil((far_y - origin[1]) / self.res - 1e-6)))
+        grid = np.full((h, w), UNKNOWN, dtype=np.uint8)
+        owner = np.zeros((h, w), dtype=np.int16)
+        grid[oy:oy + self.h, ox:ox + self.w] = self.grid
+        owner[oy:oy + self.h, ox:ox + self.w] = self.owner
+        paint = np.zeros((h, w), dtype=np.uint8)
+        old_paint = getattr(self, "paint", None)
+        if old_paint is not None:
+            paint[oy:oy + old_paint.shape[0], ox:ox + old_paint.shape[1]] = old_paint
+        if hasattr(self, "_no_approach"):
+            banned = np.zeros((h, w), dtype=bool)
+            old = self._no_approach
+            banned[oy:oy + old.shape[0], ox:ox + old.shape[1]] = old
+            self._no_approach = banned
+        self.origin = origin
+        self.h, self.w = h, w
+        self.grid = grid
+        self.owner = owner
+        self.paint = paint
+        self._sweep_cache = None
+        self._fence_pts = None
+        self._fence_field = None
+        return True
+
     def set_boundary(self, poly):
         """Move the fence to `poly`, inwards where a wall was seen, outwards where floor was.
 
         Floor the new fence leaves out stops being floor; floor it takes in becomes unswept floor.
         Swept and blocked cells stay as they are, and blocked cells keep the body away as before.
+        The grid grows when the new fence no longer fits, so exploration can keep moving the outline.
         """
+        self.ensure_room(poly)
         self.boundary = [(float(x), float(y)) for x, y in poly]
         inside = rasterize(self.origin, self.res, self.grid.shape, self.boundary)
         self.grid[~inside & (self.grid == BODY_REACH)] = UNKNOWN
@@ -150,6 +195,8 @@ class CleanMap:
         self.h = int(math.ceil((pts[:, 1].max() - pts[:, 1].min() + 2 * margin) / self.res))
         self.grid = np.full((self.h, self.w), UNKNOWN, dtype=np.uint8)
         self.owner = np.zeros((self.h, self.w), dtype=np.int16)
+        # 1 warm-up trail, 2 explore trail, 3 swept area. Survives reset_visited.
+        self.paint = np.zeros((self.h, self.w), dtype=np.uint8)
 
         inside = rasterize(self.origin, self.res, self.grid.shape, poly)
         self.furniture = []
@@ -171,9 +218,10 @@ class CleanMap:
 
         floor = inside & (self.owner == 0)
         self.grid[floor] = BODY_REACH
-        # Driving straight the body sweeps a band one width wide; turning in place it sweeps
-        # a disk of its half-diagonal. Corners of a route have to sit on plan_mask.
-        self.drive_radius = self.body_width / 2.0 + PLAN_MARGIN_M
+        # The body is a 0.30 x 0.50 x 0.80 m cuboid. On the map the footprint is the
+        # 0.30 m by 0.50 m base, so the center stays a half-diagonal away at any heading.
+        # Turning spots use the same clearance. Corners of a route have to sit on plan_mask.
+        self.drive_radius = self.robot_radius + PLAN_MARGIN_M
         self.turn_radius = self.robot_radius + PLAN_MARGIN_M
         self.drive_mask = erode(floor, max(1, int(math.ceil(self.drive_radius / self.res))))
         self.plan_mask = erode(floor, max(1, int(math.ceil(self.turn_radius / self.res))))
@@ -226,6 +274,45 @@ class CleanMap:
             return (state == UNKNOWN) | (state == BODY_REACH) | (state == BLOCKED)
         accept.write = BODY_DONE
         self._stamp(x, y, self.body_brush * 0.5, accept)
+
+    def mark_pass(self, x, y, code, radius):
+        """Remember which stage drove here. 1 warm-up, 2 explore, 3 sweep.
+
+        Sweep covers the cleaning footprint and replaces earlier colours.
+        Earlier stages leave a narrow trail and do not cover a later one.
+        """
+        if code not in (1, 2, 3) or not hasattr(self, "paint"):
+            return
+        fx = (x - self.origin[0]) / self.res - 0.5
+        fy = (y - self.origin[1]) / self.res - 0.5
+        rad = radius / self.res
+        r = int(math.ceil(rad))
+        c = int(round(fx))
+        row = int(round(fy))
+        y0, y1 = max(0, row - r), min(self.h, row + r + 1)
+        x0, x1 = max(0, c - r), min(self.w, c + r + 1)
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        disk = (yy - fy) ** 2 + (xx - fx) ** 2 <= rad * rad
+        layer = self.paint[y0:y1, x0:x1]
+        if code == 3:
+            layer[disk] = 3
+        elif code == 2:
+            layer[disk & (layer != 3)] = 2
+        else:
+            layer[disk & (layer == 0)] = 1
+
+    def reset_visited(self, x, y):
+        """Start a new visitation pass while preserving the refined boundary and obstacles."""
+        inside = rasterize(self.origin, self.res, self.grid.shape, self.boundary)
+        body_done = self.grid == BODY_DONE
+        self.grid[body_done & inside & (self.owner == 0)] = BODY_REACH
+        self.grid[body_done & ~inside] = UNKNOWN
+        self.grid[self.grid == ARM_DONE] = ARM_ONLY
+        self._sweep_cache = None
+        if hasattr(self, "_no_approach"):
+            self._no_approach[:] = False
+        # The third pass begins with only the floor physically under the robot counted visited.
+        self.stamp_body(x, y)
 
     def stamp_arm(self, x, y, furniture_id):
         def accept(y0, y1, x0, x1):

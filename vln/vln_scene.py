@@ -30,6 +30,7 @@ cal, val = nav.cal, nav.val
 
 NEAR_PITCH = 25.0  # same head-down angle vln_nav uses once the floor contact leaves the image
 LANE_PITCHES = (10.0, 20.0, 30.0)  # head-down angles for the obstacle check, far to near
+UP_PITCH = -18.0  # neck_pitch + is down; this looks above the 0.80 m body for tables and tall objects
 SELF_NCC = 0.75                    # local correlation above which a textured pixel counts as not moving
 SELF_FLAT_VAR = 40.0               # grey variance under which a 21x21 patch counts as flat
 SELF_DIFF = 30.0                   # mean grey change under which a flat patch counts as not moving
@@ -53,11 +54,15 @@ FENCE_PROMPT = """你是机器人的视觉模块，图像来自机器人头部�
 
 LANE_PROMPT = """你是机器人的避障模块，图像来自机器人头部相机，机器人正朝画面中间往前开。
 机器人本体长 0.30 米、宽 0.50 米、高 0.80 米。
-先看玻璃墙的踢脚线：光滑的灰色或白色基座和深色条纹地毯相接的那条边。看到了就用一个框框住这块基座，标签写“墙”，框的下边落在这条边上，不要落在基座的上沿，也不要落在画面最底下。玻璃能看穿，不要因此当成没有东西。
+先找玻璃和镜子。玻璃墙、玻璃门即使能看穿也是障碍；镜子里即使像还有一间房也是障碍，不能把镜中的空间当路。
+有踢脚线时，用框框住光滑的灰色或白色基座，框的下边落在基座和地毯相接处，标签写“玻璃”或“镜子”；
+没有踢脚线时，沿玻璃/镜子的下边框、立柱、反光边缘框出它与地面的接触范围。不要把框落在画面最底下。
 再把画面里其他立在地面上、机器人可能撞到的东西都框出来，每个东西一个框，最多 6 个：
 人（人的脚、鞋、腿都要框，脚是最容易被撞的）、围栏、纸板、墙、箱子、包、椅子腿、凳子腿、桌子腿、椅子底座等。
+细小物体也不能漏：瓶子、罐子、工具、插线板、玩具、细杆，以及横在机器人前方可能缠住轮子的电线或绳子都算障碍。
 离机器人越近（越靠画面下方）的越重要，一定不能漏；同一个画面里有好几个东西时全部都要框，不要只框一个。
-地面上的阴影、反光、污渍、地毯花纹不算；平放在地上的细电线不算。
+地面上的阴影、反光、污渍、地毯花纹不算；但有清楚轮廓的电线、绳子和小物体要框。
+抬头时还要框比机器人高的东西：桌面、柜面、悬空的板子。框的下边落在这个物体最下面还能看见的边缘。
 画面最下方左右两角的白色舵机、红白电线，以及底边中间的蓝色、木色板子，是机器人自己的身体，不是障碍物，不要框。
 从画面下边或左右两边伸进来的黑色竖杆、黑色管子、黑色支架，是机器人自己两侧的立柱，不是障碍物，不要框。
 框要包住整个物体的宽度（比如椅子的整个五角底座、整只鞋），框的下边要落在物体与地面接触的位置。
@@ -223,6 +228,27 @@ def _px(v, size):
     return float(np.clip(float(v) / 1000.0 * size, 0, size - 1))
 
 
+def _pixel_at_body_height(u, v, cam):
+    """Ground point under where this ray crosses the top of the 0.80 m body.
+
+    Used when the head is tilted up and the pixel never meets the floor: a table or other
+    tall object still blocks the cuboid. Returns None when the ray does not cross that height
+    in front of the camera.
+    """
+    n = cv2.undistortPoints(np.array([[[u, v]]], float), cam["K"], cam["dist"]).reshape(2)
+    rotation, origin = cam["T_base_cam"][:3, :3], cam["T_base_cam"][:3, 3]
+    direction = rotation @ np.array([n[0], n[1], 1.0])
+    if abs(direction[2]) < 1e-6:
+        return None
+    scale = (0.80 - origin[2]) / direction[2]
+    if scale <= 0.05:
+        return None
+    point = origin + scale * direction
+    if point[0] <= 0.05 or math.hypot(point[0], point[1]) > nav.MAX_RANGE_M:
+        return None
+    return float(point[0]), float(point[1])
+
+
 class Head:
     """Left head camera on the real robot, with the neck pose folded into the camera model."""
 
@@ -243,6 +269,7 @@ class Head:
         self.pose = (0.0, 0.0)
         self.shot = 0
         self.self_mask = {}  # (neck yaw, pitch) -> pixels showing the robot's own body
+        self.last_hits = []  # every object from the last multi-pitch lane look, not only the nearest
 
     def attach(self, base):
         self.base = base
@@ -357,6 +384,7 @@ class Head:
         vln_nav does when the target's floor contact leaves the image. d_yaw turns the head
         sideways (+ is right, as in vln_nav) without moving the base.
         """
+        self.saw_kickboard = False
         found = []
         for d_pitch in (0.0, NEAR_PITCH):
             cam = self._look(d_yaw, d_pitch)
@@ -366,6 +394,7 @@ class Head:
             if len(kb) >= 12:
                 pixels = [(float(u), float(v)) for u, v in kb[::max(1, len(kb) // 8)]]
                 print(f"  [{tag}] 用踢脚线下沿当边界", flush=True)
+                self.saw_kickboard = True
                 self._save(img, f"{tag}_p{int(d_pitch):02d}", pixels)
                 floor = []
                 for u, v in pixels:
@@ -408,22 +437,27 @@ class Head:
         points run along the box bottom so a wide object such as a chair base keeps its width.
         d_yaw turns the head (+ is right, as in vln_nav) to look where the body is about to turn.
 
-        The head looks down in several steps (LANE_PITCHES, far to near). A low object is only
-        visible from the steeper angles, and a far wall only from the shallow ones; the hit
-        closest to the body wins. The head ends on the last (steepest) angle, where the next
-        floor-texture snapshot is taken. near_only looks only at the steepest angle, for checks
-        of the floor right beside the body (turns, slides) where far angles add nothing.
+        The head first looks up (UP_PITCH) for tables and objects above the 0.80 m body, then
+        looks down in several steps (LANE_PITCHES, far to near). A low object is only visible
+        from the steeper angles, and a far wall only from the shallow ones; the hit closest to
+        the body wins. The head ends on the last (steepest) angle, where the next floor-texture
+        snapshot is taken. near_only looks only at the steepest angle, for checks of the floor
+        right beside the body (turns, slides) where far angles add nothing.
         """
         best, best_key, answered = None, None, False
-        for pitch in (LANE_PITCHES[-1:] if near_only else LANE_PITCHES):
+        all_hits = []
+        pitches = (LANE_PITCHES[-1],) if near_only else (UP_PITCH,) + LANE_PITCHES
+        for pitch in pitches:
             hits = self._lane_at(d_yaw, pitch)
             if hits is None:
                 continue
             answered = True
+            all_hits.extend(hits)
             for hit in hits:
                 key = _lane_key(hit, d_yaw)
                 if best_key is None or key < best_key:
                     best, best_key = hit, key
+        self.last_hits = all_hits
         if not answered:
             return None
         if best is not None:
@@ -470,7 +504,12 @@ class Head:
 
             def contact(u):
                 v = low_v if mask is None else _above_self(mask, u, low_v, y1)
-                return None if v is None else (v, val.pixel_to_floor(u, v, cam))
+                if v is None:
+                    return None
+                floor = val.pixel_to_floor(u, v, cam)
+                if floor is None:
+                    floor = _pixel_at_body_height(u, v, cam)
+                return None if floor is None else (v, floor)
 
             mid = contact((x1 + x2) / 2)
             f = None if mid is None else mid[1]
@@ -512,7 +551,7 @@ class Head:
             if ahead:
                 contact = min(ahead, key=lambda p: abs(p[1]))
                 print(f"  [{tag}] 踢脚线下沿，离车 {math.hypot(*contact):.2f} m", flush=True)
-                hits.append(("hit", contact[0], contact[1], "墙", ahead))
+                hits.append(("hit", contact[0], contact[1], "玻璃踢脚线", ahead))
         self._save(img, f"lane_{'hit' if hits else 'clear'}_{tag}", marks, boxes)
         return hits
 

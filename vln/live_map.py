@@ -31,6 +31,10 @@ PAGE = """<!DOCTYPE html>
     background: #111; image-rendering: pixelated; }
   aside { width: 280px; padding: 24px 20px; box-sizing: border-box; }
   h1 { font-size: 28px; margin: 0 0 8px; }
+  h1.warm { color: #8ec8f8; }
+  h1.explore { color: #f5be78; }
+  h1.sweep { color: #7dcea0; }
+  #stage { font-size: 18px; color: #d0d0d0; min-height: 24px; margin-bottom: 6px; }
   #status { font-size: 20px; color: #9ad07a; min-height: 28px; }
   #status.stopped { color: #f5b041; }
   #when { font-size: 15px; color: #aaa; margin: 4px 0 12px; }
@@ -47,14 +51,18 @@ PAGE = """<!DOCTYPE html>
 <main>
   <img id="map" alt="已清扫区域">
   <aside>
-    <h1>清扫</h1>
+    <h1 id="title">预热</h1>
     <div id="status"></div>
     <div id="when"></div>
     <div id="sweep"></div>
     <div class="row"><span class="swatch" style="background:#ebebeb"></span>还没扫的地面</div>
-    <div class="row"><span class="swatch" style="background:#3cb371"></span>已清扫</div>
+    <div class="row"><span class="swatch" style="background:#a8d4f5"></span>预热走过的路</div>
+    <div class="row"><span class="swatch" style="background:#f5be78"></span>探索走过的路</div>
+    <div class="row"><span class="swatch" style="background:#3cb371"></span>清扫过的区域</div>
     <div class="row"><span class="swatch" style="background:#c0392b"></span>看到的障碍</div>
-    <div class="row"><span class="swatch" style="background:#ffc83c"></span>围栏（每次运行重新测）</div>
+    <div class="row"><span class="swatch" style="background:#28c8ff"></span>雷达边界</div>
+    <div class="row"><span class="swatch" style="background:#dc50c8"></span>视觉边界</div>
+    <div class="row"><span class="swatch" style="background:#ffc83c"></span>当前使用的边界</div>
   </aside>
 </main>
 <script>
@@ -62,12 +70,22 @@ const img = document.getElementById("map");
 let version = -1;
 function tick() {
   fetch("/stats").then(r => r.json()).then(s => {
+    const text = s.status || "";
+    let phase = "";
+    if (s.stage === "预热建图" || text.indexOf("预热") === 0) phase = "warmup";
+    else if (s.stage === "探索建图" || text.indexOf("探索") === 0) phase = "explore";
+    else if (s.stage === "清扫" || text.indexOf("清扫") === 0) phase = "sweep";
+    const titles = {warmup: "预热", explore: "探索", sweep: "清扫"};
+    const counts = {warmup: "预热走过 ", explore: "探索走过 ", sweep: "已清扫 "};
+    const title = document.getElementById("title");
+    title.textContent = titles[phase] || "建图";
+    title.className = phase === "warmup" ? "warm" : phase === "explore" ? "explore" : phase === "sweep" ? "sweep" : "";
     const st = document.getElementById("status");
-    st.textContent = s.status || "";
+    st.textContent = text;
     st.className = s.running ? "" : "stopped";
     document.getElementById("when").textContent = s.when || "";
     document.getElementById("sweep").textContent =
-      s.has_map ? "已清扫 " + Math.round((s.sweep || 0) * 100) + "%" : "";
+      s.has_map && counts[phase] ? counts[phase] + Math.round((s.sweep || 0) * 100) + "%" : "";
     if (s.version !== version) {
       version = s.version;
       img.src = "/frame.jpg?v=" + version;
@@ -100,7 +118,10 @@ class MapView:
         self.arm = None
         self.remaining = []
         self.scan_points = []
+        self.lidar_bounds = []
+        self.vision_bounds = []
         self.status = "规划中"
+        self.stage = ""
         self.set_map(cmap)
 
     def set_map(self, cmap):
@@ -114,9 +135,13 @@ class MapView:
             stats = cmap.stats()
             return {
                 "grid": cmap.grid.copy(),
+                "paint": (cmap.paint.copy() if hasattr(cmap, "paint")
+                          else np.zeros(cmap.grid.shape, dtype=np.uint8)),
                 "origin": [float(cmap.origin[0]), float(cmap.origin[1])],
                 "res": float(cmap.res),
                 "boundary": [list(p) for p in cmap.boundary],
+                "lidar_bounds": [[[float(x), float(y)] for x, y in arc] for arc in self.lidar_bounds],
+                "vision_bounds": [[[float(x), float(y)] for x, y in arc] for arc in self.vision_bounds],
                 "furniture": [{k: v for k, v in f.items()} for f in cmap.furniture],
                 "body_length": float(cmap.body_length),
                 "body_width": float(cmap.body_width),
@@ -125,6 +150,7 @@ class MapView:
                 "remaining": [[float(x), float(y), k, fid] for x, y, k, fid in self.remaining],
                 "scan_points": [[float(x), float(y)] for x, y in self.scan_points],
                 "status": self.status,
+                "stage": {"warmup": "预热建图", "explore": "探索建图", "sweep": "清扫"}.get(self.stage, ""),
                 "sweep": stats["sweep"],
                 "has_map": bool(cmap.boundary),
             }
@@ -132,13 +158,14 @@ class MapView:
     def write(self, map_dir, running=True):
         st = self.state()
         grid = st.pop("grid")
+        paint = st.pop("paint")
         st["running"] = running
         st["updated"] = time.time()
         os.makedirs(map_dir, exist_ok=True)
         path = os.path.join(map_dir, LIVE_FILE)
         # The writer thread and the final write may overlap; each needs its own temp file.
         tmp = f"{path}.{threading.get_ident()}.tmp.npz"
-        np.savez_compressed(tmp, grid=grid, meta=np.array(json.dumps(st, ensure_ascii=False)))
+        np.savez_compressed(tmp, grid=grid, paint=paint, meta=np.array(json.dumps(st, ensure_ascii=False)))
         os.replace(tmp, path)
 
     def start_writer(self, map_dir, period=0.3):
@@ -160,6 +187,10 @@ def read_state(map_dir):
     with np.load(path) as data:
         st = json.loads(str(data["meta"]))
         st["grid"] = data["grid"]
+        if "paint" in data.files:
+            st["paint"] = data["paint"]
+        else:
+            st["paint"] = np.zeros(st["grid"].shape, dtype=np.uint8)
     return st
 
 
@@ -170,8 +201,16 @@ def _crop(st, border=0.30):
     res = st["res"]
     ox, oy = st["origin"]
     pts = [tuple(p) for p in st["boundary"]] + [tuple(p) for p in st["scan_points"]]
+    for arc in st.get("lidar_bounds", []) + st.get("vision_bounds", []):
+        pts.extend(tuple(p) for p in arc)
     if st["robot"] is not None:
         pts.append((st["robot"][0], st["robot"][1]))
+    paint = st.get("paint")
+    if paint is not None and paint.shape == grid.shape:
+        ys, xs = np.where(paint != 0)
+        if len(xs):
+            pts.append((ox + (float(xs.min()) + 0.5) * res, oy + (float(ys.min()) + 0.5) * res))
+            pts.append((ox + (float(xs.max()) + 0.5) * res, oy + (float(ys.max()) + 0.5) * res))
     ys, xs = np.where(grid == BODY_DONE)
     if len(xs) and not st["boundary"]:
         pts.append((ox + (float(xs.min()) + 0.5) * res, oy + (float(ys.min()) + 0.5) * res))
@@ -188,8 +227,27 @@ def _crop(st, border=0.30):
     return grid[r0:r1, c0:c1], ox + c0 * res, oy + r0 * res
 
 
-def render(st):
+def _window(st, border=0.30):
+    """Cropped grid, paint layer, and the world origin of the crop."""
     grid, ox, oy = _crop(st)
+    full = st["grid"]
+    paint = st.get("paint")
+    if paint is None or paint.shape != full.shape or grid.shape == full.shape:
+        if paint is None or paint.shape != full.shape:
+            paint = np.zeros(grid.shape, dtype=np.uint8)
+        elif grid.shape == full.shape:
+            pass
+        return grid, paint if paint.shape == grid.shape else np.zeros(grid.shape, np.uint8), ox, oy
+    res = st["res"]
+    full_ox, full_oy = st["origin"]
+    c0 = int(round((ox - full_ox) / res))
+    r0 = int(round((oy - full_oy) / res))
+    r1, c1 = r0 + grid.shape[0], c0 + grid.shape[1]
+    return grid, paint[r0:r1, c0:c1], ox, oy
+
+
+def render(st):
+    grid, paint, ox, oy = _window(st)
     h, w = grid.shape
     res = st["res"]
     scale = max(6, min(24, 900 // max(w, h, 1)))
@@ -199,7 +257,15 @@ def render(st):
         return (pad + int(round((x - ox) / res * scale)),
                 pad + int(round((h - (y - oy) / res) * scale)))
 
-    small = np.flipud(COLORS[grid])
+    # Green is only the cleaning pass. Warm-up and explore trails keep their own colours,
+    # including after those passes clear the visited cells used by the planner.
+    colored = COLORS[grid]
+    if paint.shape == grid.shape:
+        colored[(grid == BODY_DONE) & (paint != 3)] = COLORS[BODY_REACH]
+        colored[paint == 1] = (245, 212, 168)  # light blue, BGR
+        colored[paint == 2] = (120, 190, 245)  # light orange, BGR
+        colored[paint == 3] = COLORS[BODY_DONE]
+    small = np.flipud(colored)
     big = cv2.resize(small, (w * scale, h * scale), interpolation=cv2.INTER_NEAREST)
     canvas = np.full((big.shape[0] + 2 * pad, big.shape[1] + 2 * pad, 3), 18, np.uint8)
     canvas[pad:pad + big.shape[0], pad:pad + big.shape[1]] = big
@@ -209,7 +275,11 @@ def render(st):
             return
         cv2.polylines(canvas, [np.array([px(x, y) for x, y in points], np.int32)], closed, color, width, cv2.LINE_AA)
 
-    poly(st["boundary"], (60, 200, 255), True, 3)
+    for arc in st.get("lidar_bounds", []):
+        poly(arc, (255, 200, 40), False, 2)
+    for arc in st.get("vision_bounds", []):
+        poly(arc, (200, 80, 220), False, 2)
+    poly(st["boundary"], (60, 200, 255), True, 2)
     for x, y in st["scan_points"]:
         cv2.circle(canvas, px(x, y), 2, (200, 200, 80), -1, cv2.LINE_AA)
     for item in st["furniture"]:
