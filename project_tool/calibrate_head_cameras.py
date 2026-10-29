@@ -5,7 +5,7 @@
   cali_intri  intrinsics for each eye + left->right stereo extrinsics
   cali_extri  board standing upright on the floor facing the robot -> pose of each eye in the base frame
 
-Board: 5x7 squares, DICT_5X5_50, square 28.2 mm, marker ~20 mm.
+Board: 7x5 squares, DICT_5X5_50, square 40 mm, marker 30 mm.
 Base frame matches LeKiwiBase: x forward, y left, z up, origin at base center on the floor.
 """
 
@@ -35,7 +35,7 @@ DEFAULT_DATA = os.path.expanduser("~/workspaces/FXLerobot/FXlerobot/calib/head")
 
 def make_board(square_mm, marker_mm):
     dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_50)
-    board = cv2.aruco.CharucoBoard((5, 7), square_mm / 1000.0, marker_mm / 1000.0, dictionary)
+    board = cv2.aruco.CharucoBoard((7, 5), square_mm / 1000.0, marker_mm / 1000.0, dictionary)
     return board, cv2.aruco.CharucoDetector(board)
 
 
@@ -251,7 +251,7 @@ def cmd_calibrate(args):
     out = {
         "image_size": [WIDTH, HEIGHT],
         "focus_absolute": args.focus,
-        "board": {"squares": [5, 7], "dict": "DICT_5X5_50",
+        "board": {"squares": [7, 5], "dict": "DICT_5X5_50",
                   "square_mm": args.square_mm, "marker_mm": args.marker_mm},
         "stereo": stereo,
     }
@@ -380,8 +380,8 @@ def cmd_extrinsic(args):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--data", default=DEFAULT_DATA)
-    p.add_argument("--square-mm", type=float, default=28.2)
-    p.add_argument("--marker-mm", type=float, default=20.0)
+    p.add_argument("--square-mm", type=float, default=40.0)
+    p.add_argument("--marker-mm", type=float, default=30.0)
     p.add_argument("--focus", type=int, default=0, help="C920 focus_absolute, 0 = infinity")
     sub = p.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("capture")

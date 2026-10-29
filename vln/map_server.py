@@ -20,7 +20,7 @@ import cv2
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from live_map import LIVE_FILE, PAGE, blank, read_state, render  # noqa: E402
+from live_map import LIVE_FILE, PAGE, blank, object_rows, read_state, render  # noqa: E402
 
 MAP_DIR = os.path.join(HERE, "map")
 STALE_S = 5.0  # no update for this long while marked running: the program died without saying so
@@ -75,7 +75,8 @@ class Cache:
         status = st["status"] if running else f"程序没在运行 · 上次：{st['status']}"
         return {"status": status, "stage": st.get("stage", ""), "running": running,
                 "when": f"更新于 {when}", "has_map": st.get("has_map", False),
-                "sweep": st.get("sweep", 0.0), "furniture": st.get("furniture", []), "version": version}
+                "sweep": st.get("sweep", 0.0), "furniture": st.get("furniture", []), "version": version,
+                "objects": object_rows(st.get("objects") or [])}
 
 
 def main():
@@ -109,7 +110,21 @@ def main():
 
     httpd = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
     print(f"map server on :{args.port}, reading {cache.path}", flush=True)
-    httpd.serve_forever()
+    threading.Thread(target=httpd.serve_forever, name="http", daemon=True).start()
+    # The server outlives coverage_run.py, so it would keep drawing with old code after an update.
+    # When the drawing code changes it starts itself again (the open page reconnects on its own).
+    sources = [os.path.abspath(__file__), os.path.join(HERE, "live_map.py"), os.path.join(HERE, "occmap.py")]
+    stamp = [os.path.getmtime(f) for f in sources]
+    while True:
+        time.sleep(2.0)
+        try:
+            changed = [os.path.getmtime(f) for f in sources] != stamp
+        except OSError:
+            continue
+        if changed:
+            print("drawing code changed, restarting the map server", flush=True)
+            httpd.server_close()
+            os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 if __name__ == "__main__":

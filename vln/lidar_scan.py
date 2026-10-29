@@ -1,7 +1,7 @@
 """RPLIDAR on the robot. One full turn is a set of points in the base frame: x forward, y left.
 
-Glass and mirrors are not in these points. A return from glass is either a reflection or
-nothing, so the caller drops every return that lies in a direction the camera called glass.
+Floor-standing glass and mirrors are not in these points: a return there is a reflection or what
+stands behind. The map stops rays where the stereo measured such glass (occmap.OccMap.insert_scan).
 """
 
 import glob
@@ -15,9 +15,9 @@ import serial
 BAUD = 460800
 # C1: ignore the robot body inside 0.25 m. White targets are valid out to 12 m.
 RMIN, RMAX = 0.25, 12.0
-EXTENT_BIN_DEG = 5.0
-# A return this much closer than the surrounding wall is something standing in the room, not the wall.
-INSET_M = 0.40
+# The body blocks the lidar behind: back there it only returns the robot itself (a steady 0.26 m
+# echo at -140°) or nothing. Returns farther round from the nose than this are dropped.
+VIEW_DEG = 100.0
 
 
 def find_port():
@@ -53,27 +53,20 @@ class Lidar:
     def close(self):
         self._stop = True
         if self._thread is not None:
-            self._thread.join(3.0)
+            self._thread.join(5.0)  # the reader drains the stream before it closes the port
 
-    def extent(self, shots=4):
-        """Rough room outline from a few full turns, plus objects that stand inside it.
-
-        Both are in the base frame (x forward, y left). The outline is the nearest return in
-        each direction, except where one direction sticks in: that return is an object and the
-        outline keeps the farther surrounding range. Glass is wrong here, either missing or
-        mirrored; the camera corrects those directions later.
-        """
-        scans, seen = [], None
-        deadline = time.time() + 3.0
-        while len(scans) < shots and time.time() < deadline:
-            xy = self.latest_xy()
-            if xy is not None and xy is not seen:
-                scans.append(xy)
-                seen = xy
-            time.sleep(0.15)
-        if not scans:
-            raise RuntimeError("雷达没有一整圈数据")
-        return _extent(np.vstack(scans))
+    def scans(self, n=2, timeout=2.0):
+        """The next n full turns (each N x 2, base frame), for a robot standing still. [] on timeout."""
+        out, seen = [], self._stamp
+        deadline = time.time() + timeout
+        while len(out) < n and time.time() < deadline:
+            with self._lock:
+                stamp, xy = self._stamp, self._xy
+            if stamp != seen and xy is not None:
+                out.append(xy.copy())
+                seen = stamp
+            time.sleep(0.02)
+        return out if len(out) == n else []
 
     def latest_xy(self):
         """Nx2 array of the newest full turn, or None when it is missing or older than a second."""
@@ -115,8 +108,18 @@ class Lidar:
                     if RMIN < dist < RMAX:
                         cur.append((ang, dist))
         finally:
+            # Stop the scan and read out what is still arriving before closing. Closed while the
+            # lidar still streams at 460800 baud, the CP2102's purge and disable requests time out
+            # (dmesg: "failed set request 0x12 status: -110") and the next open fails with an I/O
+            # error until the USB cable is replugged.
             try:
                 link.write(b"\xa5\x25")
+                link.timeout = 0.05
+                quiet = time.time() + 2.0
+                while time.time() < quiet and link.read(4096):
+                    pass
+                time.sleep(0.05)
+                link.reset_input_buffer()
             except serial.SerialException:
                 pass
             link.close()
@@ -124,38 +127,9 @@ class Lidar:
     def _store(self, scan):
         # The angle increases clockwise and 0 is the nose. Flip it so y is left.
         ang = -np.deg2rad(scan[:, 0])
-        dist = scan[:, 1]
+        front = np.abs(np.arctan2(np.sin(ang), np.cos(ang))) <= np.deg2rad(VIEW_DEG)
+        ang, dist = ang[front], scan[front, 1]
         xy = np.c_[dist * np.cos(ang), dist * np.sin(ang)]
         with self._lock:
             self._xy = xy
             self._stamp = time.time()
-
-
-def _extent(xy):
-    """Returns (outline, objects), each a list of (x, y)."""
-    n = int(round(360.0 / EXTENT_BIN_DEG))
-    nearest = [None] * n
-    for x, y in xy:
-        dist = float(np.hypot(x, y))
-        i = int((np.degrees(np.arctan2(y, x)) % 360.0) // EXTENT_BIN_DEG) % n
-        if nearest[i] is None or dist < nearest[i][0]:
-            nearest[i] = (dist, float(x), float(y))
-    known = [i for i, item in enumerate(nearest) if item is not None]
-    if len(known) < n // 3:
-        raise RuntimeError("雷达只有 %d 个方向有回波" % len(known))
-    for i in range(n):
-        if nearest[i] is not None:
-            continue
-        prev_i = max((k for k in known if k < i), default=known[-1])
-        next_i = min((k for k in known if k > i), default=known[0])
-        nearest[i] = nearest[prev_i] if abs(i - prev_i) <= abs(i - next_i) else nearest[next_i]
-    outline, objects = [], []
-    for i, (dist, x, y) in enumerate(nearest):
-        window = [nearest[(i + k) % n][0] for k in range(-4, 5) if k != 0]
-        wall = float(np.median(window))
-        ang = np.deg2rad((i + 0.5) * EXTENT_BIN_DEG)
-        if dist < wall - INSET_M:
-            objects.append((x, y))
-            dist = wall
-        outline.append((dist * np.cos(ang), dist * np.sin(ang)))
-    return outline, objects
