@@ -5,8 +5,8 @@ lidar-occupied once it was hit at least HIT_MIN times and by at least HIT_SHARE 
 reached it, so a person who walks away is passed through and cleared again. The lidar sits low:
 tabletops, wires flatter than its beam and floor-standing glass come from the cameras and are kept
 in a separate layer with the time until which they block (people expire, furniture does not).
-Things the cameras named and measured are modelled as rectangles (coverage_run) in their own layer,
-rebuilt whenever a model changes; floor the body stood on is never blocked by them. Small things
+Floor under the overhangs of the things the cameras named (tables, shelves) is kept in its own
+layer (coverage_run.block_objects); floor the body stood on is never blocked by it. Small things
 on the floor the arms pick up are kept apart (TRASH): the body drives round them, it does not run
 them over, and they never hide what the lidar measured.
 
@@ -28,6 +28,8 @@ BODY_HEIGHT_M = 0.80
 BODY_CLEARANCE_M = math.hypot(BODY_LENGTH_M / 2.0, BODY_WIDTH_M / 2.0)
 PLAN_MARGIN_M = 0.04  # extra room kept when planning, for pose error
 
+RES_M = 0.025          # cell size: about the lidar's step between returns at 1.5 m (1 degree)
+FRONTIER_CLOSE_M = 0.25  # gaps between far rays this small are closed before looking for unknown floor
 HIT_MIN = 2
 HIT_SHARE = 0.25
 MATCH_TRIM_M = 0.15   # a scan point farther than this from every occupied cell counts this much
@@ -48,7 +50,7 @@ def disk(radius_cells):
 
 
 class OccMap:
-    def __init__(self, size_m=24.0, res=0.05, center=(0.0, 0.0)):
+    def __init__(self, size_m=24.0, res=RES_M, center=(0.0, 0.0)):
         self.res = res
         self.w = self.h = int(round(size_m / res))
         self.origin = (center[0] - size_m / 2.0, center[1] - size_m / 2.0)
@@ -59,8 +61,8 @@ class OccMap:
         self.vis_end = np.zeros(shape, np.float64)  # camera obstacle blocks until this time.monotonic()
         self.glass = np.zeros(shape, bool)       # floor-standing glass or mirror: lidar rays stop here
         self.trash = np.zeros(shape, bool)       # small things to pick up: driven round
-        self.objects = np.zeros(shape, bool)     # rectangles of the modelled things (coverage_run)
-        self.floor_seen = np.zeros(shape, bool)  # the stereo measured bare floor here
+        self.trash_low = np.zeros(shape, bool)   # small things to pick up flat enough to drive over
+        self.objects = np.zeros(shape, bool)     # floor under measured overhangs (coverage_run)
         self.stood = np.zeros(shape, bool)       # the body stood here
         self.swept = np.zeros(shape, bool)
         self.paint = np.zeros(shape, np.uint8)   # 1 warm-up, 2 explore, 3 sweep trail (live_map colours)
@@ -123,7 +125,7 @@ class OccMap:
         grid[free] = BODY_REACH
         grid[free & self.swept] = BODY_DONE
         grid[occ] = BLOCKED
-        grid[self.trash] = TRASH  # blocks like the rest, drawn apart: the arms pick these up
+        grid[self.trash | (self.trash_low & ~occ)] = TRASH  # drawn apart: the arms pick these up
         self.grid = grid
         self._sweep_cache = None
         self._field = None
@@ -185,27 +187,29 @@ class OccMap:
         self.glass |= self.mask_of(xy, self.res)
         self.seen |= self.glass
 
-    def mark_floor(self, xy):
-        """The stereo measured bare floor at these map points."""
-        self.floor_seen |= self.mask_of(xy, 0.0)
-
-    def mark_trash(self, xy, radius=0.03):
-        self.trash |= self.mask_of(xy, radius)
+    def mark_trash(self, xy, radius=0.03, passable=False):
+        """Small things to pick up at map points: driven round, or driven over when `passable`."""
+        mask = self.mask_of(xy, radius)
+        if passable:
+            self.trash_low |= mask
+        else:
+            self.trash |= mask
 
     def is_trash(self, x, y):
         cell = self.world_to_cell(x, y)
-        return cell is not None and bool(self.trash[cell])
+        return cell is not None and bool(self.trash[cell] or self.trash_low[cell])
 
     def clear_vis(self, mask):
         """The cameras saw bare floor there: older camera obstacles and trash are gone. Returns cells cleared."""
-        mask = mask & ((self.vis_end > 0) | self.trash)
+        mask = mask & ((self.vis_end > 0) | self.trash | self.trash_low)
         self.vis_end[mask] = 0.0
         self.trash[mask] = False
+        self.trash_low[mask] = False
         return int(mask.sum())
 
     def unblock(self, mask):
-        """The body stood there, so nothing can: lidar and camera marks under it go, and the
-        trash it passed over is swept up."""
+        """The body stood there, so nothing that blocks can be there: lidar and camera marks under it
+        go. Flat things it drove over are still there to pick up."""
         mask = mask & (self._occ | (self.vis_end > 0) | self.trash)
         self.hit[mask] = 0
         self.vis_end[mask] = 0.0
@@ -248,7 +252,8 @@ class OccMap:
 
         Small gaps between far rays are closed first; they are not unexplored floor.
         """
-        known = cv2.morphologyEx(self.seen.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)) > 0
+        k = max(1, int(round(FRONTIER_CLOSE_M / self.res)))
+        known = cv2.morphologyEx(self.seen.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((k, k), np.uint8)) > 0
         free = known & ~self._occ
         return free & (cv2.dilate((~known).astype(np.uint8), np.ones((3, 3), np.uint8)) > 0)
 

@@ -76,6 +76,7 @@ BOX_EDGE_PX = 8.0        # a VLM box edge is about this many pixels off the thin
 BOX_EDGE_M = 0.03        # plus this much between the box bottom and where the lidar beam meets the thing
 OBJECT_DEPTH_M = 0.50    # points this far behind a thing's nearest point still belong to it
 LIDAR_PAD_DEG = 2.0      # lidar returns this far either side of a box still count
+GLASS_BIN_DEG = 2.0      # the foot of a window or mirror: the farthest lidar return every this many degrees
 FLOOR_SEEN_M = 2.0       # stereo floor points farther than this do not clear old marks
 BOUNDARY_KEYS = ("墙", "围栏", "栏杆", "踢脚", "基座")  # the lidar maps these where it sees them
 GLASS_KEYS = ("玻璃", "镜")
@@ -83,10 +84,23 @@ GLASS_KEYS = ("玻璃", "镜")
 # sheet of cardboard called 包装 or 纸屑 is an obstacle.
 PICK_KEYS = ("垃圾", "纸团", "纸屑", "纸巾", "塑料袋", "包装", "瓶", "罐", "果皮", "烟头", "碎屑", "食物", "小物件")
 PICK_MAX_M = 0.15        # longest side of a thing the grippers take
+# Long thin things on the floor: placed along the line the VLM traces through them, not over their box.
+WIRE_KEYS = ("电线", "数据线", "网线", "充电线", "线缆", "绳")
+# Things that lie flat on the floor: the stereo floor patch in their box is them. In the box of anything
+# standing (a cabinet with a plain white front) the floor patch is the floor in front of it.
+FLAT_KEYS = PICK_KEYS + WIRE_KEYS + ("插线板", "充电器", "地毯", "垫", "鞋")
+WIRE_JUMP_M = 0.30       # traced points this far apart on the floor: the wire left the floor between them
+WIRE_STEREO_PX = 6.0     # a traced point takes the stereo point this close to it, when there is one
 # A thing on legs: the legs are apart and the top joins them. Anything else is one connected body.
 SPANNING_KEYS = ("桌", "椅", "凳", "支架", "三脚架")
+# Legs of one seat: neighbouring wheels of a 0.65 m five-star chair base are 0.38 m apart. Legs this close
+# are one chair or stool, and the floor between them is under its seat; table legs are farther apart.
+SEAT_GAP_M = 0.40
+TOP_GAP_M = 0.15         # going up from the floor, a gap this tall in a thing's stereo heights ends it
+TOP_REACH_M = 0.08       # stereo points of the up look this close to a thing's cells are above it
 # Part names the VLM may still give, and the thing they belong to.
-PART_NAMES = {"桌子": ("桌面", "桌沿", "桌前沿", "桌腿", "桌下", "抽屉", "托盘", "键盘架"), "柜子": ("柜面", "隔板")}
+# A plain 托盘 is a tray on the floor, not part of a table (桌下托盘 is, by 桌下).
+PART_NAMES = {"桌子": ("桌面", "桌沿", "桌前沿", "桌腿", "桌下", "抽屉", "键盘架"), "柜子": ("柜面", "隔板")}
 CLUSTER_GAP_M = 0.08     # points of one body are this close: stereo cells are 0.04 m, lidar returns 1° apart
 # A tabletop, drawer or tray over open floor. The camera sits about 0.69 m up, below the 0.80 m body
 # top, so the ray to the lower edge of a 0.72 m tabletop crosses 0.80 m behind the edge: the picture
@@ -96,12 +110,20 @@ OVERHEAD_TAG = "悬空"      # label prefix older runs gave such hits
 OVERHEAD_DEPTH_M = 0.70    # supports this far behind the nearest one still belong to it
 OVERHEAD_PAD_DEG = 3.0     # supports this far either side of the box still count
 OVERHEAD_RAY_DEG = 4.0     # an edge sample takes the nearest support at most this far round from it
+# Lidar returns an overhang needs under it. Legs give 2-3 returns each: in the logs every real table had
+# 5 or more, and all 0-2 cases were desks far beyond the cardboard fence placed onto a stray return.
+OVERHEAD_MIN_LIDAR = 3
+# An overhang's lower edge is at least this high (desk edges 0.6-0.75 m, drawers and trays about 0.45 m).
+# Lower comes out a base or kickboard, or a far desk ranged onto something standing in front of it.
+OVERHANG_MIN_Z = 0.30
 
 # label, points and sure in the base frame (x forward, y left). kind: floor, person, trash (small, to
 # pick up), overhead, glass or near (stereo cells outside every box; sure are the ones seen again from
 # another view). height: metres measured to its top (a table: its lower edge), None when not measured;
-# top_cut: the box reached the image top, so the thing is at least that high.
-Hit = namedtuple("Hit", "label points sure kind how height top_cut", defaults=(None, False))
+# top_cut: the box reached the image top, so the thing is at least that high. area: polygons (base
+# frame) of floor the body cannot reach though nothing stands there: under a measured overhang, or
+# between the legs of a chair or stool.
+Hit = namedtuple("Hit", "label points sure kind how height top_cut area", defaults=(None, False, None))
 
 GLASS_RULE = """如果看到玻璃墙、玻璃门、窗户或镜子：玻璃或镜面一直落到地面、下面没有实心矮墙或踢脚线的，标签写“落地玻璃”或“落地镜子”，框的下边落在它和地面相接处；下面有实心矮墙、踢脚线或柜子挡着的，标签写“玻璃窗”或“镜子”。
 透过玻璃看到的东西、镜子里映出来的东西、越过围栏或墙看到的东西都不在这里，一律不要框。别的墙、围栏、纸板挡板不用框。"""
@@ -115,8 +137,9 @@ LANE_PROMPT = """你是机器人的视觉模块，场景是办公室，图像来
 桌子、柜子、椅子框整件，包括桌面、座面和扶手，标签写“桌子”“柜子”“椅子”，不要写桌面、抽屉、隔板这种部件名。人的脚、鞋、腿都算“人”。
 颜色相同不等于同一种东西：巴掌大以内的碎纸写“纸屑”或“纸团”；比这大的纸板、纸箱，不管平放还是立着，写“纸板”或“纸箱”。
 细小的东西也要框；地面上的阴影、反光、污渍、地毯花纹不算。框要包住整个物体，框的下边落在它和地面接触的地方。
+电线、数据线、网线、绳子这类细长的东西，框之外再给出 "line"：沿着它在画面里的走向，从一端到另一端取 3 到 8 个点，每个点都落在线上，格式 [[x, y], ...]，坐标同样用 0-1000 归一化。
 """ + GLASS_RULE + "\n" + SELF_RULE + """
-只输出 JSON，不要其他文字：{"objects": [{"bbox": [x1, y1, x2, y2], "label": "名字"}, ...]}；什么都没有输出 {"objects": []}。
+只输出 JSON，不要其他文字：{"objects": [{"bbox": [x1, y1, x2, y2], "label": "名字"}, {"bbox": [x1, y1, x2, y2], "label": "电线", "line": [[x, y], ...]}, ...]}；什么都没有输出 {"objects": []}。
 坐标用 0-1000 归一化，图像左上角为 (0,0)，右下角为 (1000,1000)。"""
 
 OVERHEAD_PROMPT = """你是机器人的避障模块，场景是办公室，图像来自机器人头部相机，相机离地约 0.7 米，稍微朝下看，机器人正朝画面中间往前开。
@@ -124,7 +147,7 @@ OVERHEAD_PROMPT = """你是机器人的避障模块，场景是办公室，图�
 找家具伸到地面上方、下面是空的、会挡住机器人上半身的部分：桌子的桌面和前沿、桌下的抽屉、托盘、键盘架、线槽，柜子和书架伸出来的柜面、隔板。
 它们常常只在画面最上方露出一条边，或者从画面上沿伸下来，也一定要框。框要包住它在画面里的整个宽度，框的下边落在它最下面还能看见的那条边上。
 标签写整件家具的名字：“桌子”“柜子”“书架”，不要写桌面、抽屉、隔板这种部件名。
-一直落到地面的柜子、窗台下面的矮墙、踢脚线这里不要框；立在地上的东西（人、椅子、凳子、箱子、包、电线、垃圾）这里也不要框，另外检查。
+一直落到地面的柜子、窗台下面的矮墙、踢脚线这里不要框；立在或放在地上的东西（人、椅子、凳子、箱子、包、托盘、垫子、电线、垃圾）这里也不要框，另外检查。
 """ + GLASS_RULE + "\n" + SELF_RULE + """
 只输出 JSON，不要其他文字：{"objects": [{"bbox": [x1, y1, x2, y2], "label": "名字"}, ...]}；没有这些东西输出 {"objects": []}。
 坐标用 0-1000 归一化，图像左上角为 (0,0)，右下角为 (1000,1000)。"""
@@ -189,6 +212,7 @@ def _numbers(values, n):
 
 def parse_reply(reply):
     """JSON from the model, tolerating the slips Qwen makes."""
+    reply = re.sub(r'"bbox_\s*\[', '"bbox_2d": [', reply)  # qwen3.8-max now and then leaves the key unfinished
     m = re.search(r"\{.*\}", reply, re.S)
     if m:
         try:
@@ -202,7 +226,7 @@ def parse_reply(reply):
 
 
 def _objects(ans):
-    """(label, [x1, y1, x2, y2] in pixels) of every box in a reply."""
+    """(label, [x1, y1, x2, y2] in pixels, traced line in pixels or None) of every box in a reply."""
     objs = (ans or {}).get("objects")
     if objs is None and (ans or {}).get("bbox"):  # older single-box answer
         objs = [ans]
@@ -215,7 +239,10 @@ def _objects(ans):
             continue
         x1, x2 = sorted((_px(box[0], cal.WIDTH), _px(box[2], cal.WIDTH)))
         y1, y2 = sorted((_px(box[1], cal.HEIGHT), _px(box[3], cal.HEIGHT)))
-        out.append((object_name(str(obj.get("label") or "障碍")), (x1, y1, x2, y2)))
+        line = None
+        if isinstance(obj.get("line"), list):
+            line = [(_px(p[0], cal.WIDTH), _px(p[1], cal.HEIGHT)) for p in (_numbers(q, 2) for q in obj["line"]) if p]
+        out.append((object_name(str(obj.get("label") or "障碍")), (x1, y1, x2, y2), line if line and len(line) >= 2 else None))
     return out
 
 
@@ -239,6 +266,18 @@ def floor_size(points):
         return 0.0, 0.0
     _, (w, h), _ = cv2.minAreaRect(np.asarray(points, np.float32))
     return float(max(w, h)), float(min(w, h))
+
+
+def _top(zs):
+    """Height (m) of one thing from its stereo heights: from the lowest standing point up, as long as
+    no gap taller than TOP_GAP_M opens (what is higher is something else above it, a desk over a
+    chair). None when fewer than STEREO_MIN_PTS points stand."""
+    zs = np.sort(np.asarray(zs, np.float64)[np.asarray(zs) >= STEREO_MIN_Z])
+    if len(zs) < STEREO_MIN_PTS:
+        return None
+    gaps = np.nonzero(np.diff(zs) > TOP_GAP_M)[0]
+    end = int(gaps[0]) + 1 if len(gaps) else len(zs)
+    return float(np.percentile(zs[:end], 95))
 
 
 def _connected(points, gap=CLUSTER_GAP_M):
@@ -328,8 +367,11 @@ class Head:
         self.where = None    # map pose (x, y, yaw rad) of the body during the current look
         self.near_seen = {}  # map cell -> camera viewpoints that measured an unboxed stereo cell there
         self.lidar_xy = None  # callable -> N x 2 lidar returns in the base frame, or None
+        self.taken = None     # callable(map points) -> bools: points on things already known to be something else
         self.last_hits = []
         self.last_floor = []
+        self.glass_spans = []  # bearings (lo, hi rad, base frame) of the glass and mirrors in this stop's pictures
+        self.last_glass = []   # their feet as lidar polylines (base frame), see _glass_feet
 
     def attach(self, base):
         self.base = base
@@ -413,12 +455,16 @@ class Head:
         last_floor keeps the floor points the stereo measured, which clear older marks.
         """
         self.where = where
+        self.glass_spans = []
+        self.up_view = None
         hits, floor = [], []
         for pitch in (UP_PITCH,) + ((LANE_PITCHES[-1],) if near_only else LANE_PITCHES):
             got, flat = self._lane_at(d_yaw, pitch)
             hits += got
             floor += flat
+        hits = [self._top_from_up(h) for h in hits]
         self.last_hits, self.last_floor = hits, floor
+        self.last_glass = self._glass_feet()
         return hits
 
     def _lane_at(self, d_yaw, pitch):
@@ -432,12 +478,15 @@ class Head:
         pts = self.stereo.points(img, right, cam["T_base_cam"])
         tag = f"p{int(pitch):02d}"
         mask = self.self_mask.get((float(d_yaw), float(pitch)))
+        if up:  # the down looks' things whose tops are out of their pictures are measured on this one
+            xyz = pts[self._usable(pts, mask=mask)]
+            self.up_view = (cam, xyz[(xyz[:, 2] >= STEREO_MIN_Z) & (xyz[:, 2] <= 2.0)])
         # The robot's own servos and wires sit in the bottom of the frame; the steeper the head,
         # the higher they climb.
         self_top = min(0.9, SELF_TOP - 0.01 * (pitch - NEAR_PITCH))
         hits, boxes, marks = [], [], []
         shown = np.zeros(pts.shape[:2], bool)
-        for label, box in _objects(ans):
+        for label, box, line in _objects(ans):
             x1, y1, x2, y2 = box
             if mask is not None:
                 on_self = float(mask[int(y1):int(y2) + 1, int(x1):int(x2) + 1].mean())
@@ -449,6 +498,9 @@ class Head:
                 continue
             boxes.append(box)
             if any(k in label for k in GLASS_KEYS):
+                rays = self._rays(cam, x1, x2, min(y2, cal.HEIGHT - 1))
+                if rays:
+                    self.glass_spans.append((min(b for b, _ in rays), max(b for b, _ in rays)))
                 if "落地" not in label:
                     print(f"  [{tag}] {label}不落地，下面有实心的东西，边界听雷达的", flush=True)
                     continue
@@ -459,7 +511,7 @@ class Head:
             elif up:
                 hit, kept = self._overhead(label, box, cam, pts, mask, tag)
             else:
-                hit, kept = self._locate(label, box, cam, pts, mask, tag)
+                hit, kept = self._locate(label, box, cam, pts, mask, tag, line)
             shown |= kept
             if hit is None:
                 continue
@@ -475,7 +527,8 @@ class Head:
             sure = self._confirm(near)
             print(f"  [{tag}] 框外双目量到立着的东西 {len(near)} 格（换个角度也量到的 {len(sure)} 格），"
                   f"最近 {math.hypot(*near[0]):.2f} m", flush=True)
-            hits.append(Hit(STEREO_LABEL, near, sure, "near", "双目"))
+            top = _top(pts[kept][:, 2])
+            hits.append(Hit(STEREO_LABEL, near, sure, "near", "双目", top, False))
         self._save(img, f"lane_{'hit' if hits else 'clear'}_{tag}", marks, boxes, self.stereo.uv[shown][::3])
         return hits, self._floor(pts, mask)
 
@@ -547,7 +600,98 @@ class Head:
                 out.append((px, py))
         return out
 
-    def _locate(self, label, box, cam, pts, mask, tag):
+    def _top_from_up(self, hit):
+        """A thing seen looking down with its top out of the picture, its height measured on the up
+        look of the same stop: the stereo points above its cells, up to where they stop (_top)."""
+        if not hit.top_cut or hit.kind not in ("floor", "trash", "person") or self.up_view is None:
+            return hit
+        cam, xyz = self.up_view
+        if not len(xyz) or not hit.points:
+            return hit
+        cells = np.asarray(hit.points, np.float64)
+        d2 = ((xyz[:, None, :2] - cells[None, :, :]) ** 2).sum(-1).min(axis=1)
+        top = _top(xyz[d2 <= TOP_REACH_M * TOP_REACH_M][:, 2])
+        if top is None or top <= (hit.height or 0.0):
+            return hit
+        near = min(math.hypot(*p) for p in hit.points)
+        rays = self._rays(cam, 0.0, cal.WIDTH - 1.0, 0.0, 3)
+        view_top = float(cam["T_base_cam"][2, 3]) + min(rise for _, rise in rays) * near if rays else math.inf
+        cut = top >= view_top - STEREO_CELL_M
+        print(f"  {hit.label}的顶在抬头看的双目里量到离地{'至少' if cut else '约'} {top:.2f} m", flush=True)
+        return hit._replace(height=top, top_cut=cut)
+
+    def _glass_feet(self):
+        """Where the glass and mirrors of this stop stand: in each span's bearings, the farthest lidar
+        return every GLASS_BIN_DEG, as one polyline per span (base frame, sorted by bearing).
+
+        A window or mirror that does not reach the floor stands on a solid sill, wall or cabinet the
+        low lidar sees; what the cameras see beyond that line is behind the glass or in the mirror.
+        """
+        xy = self.lidar_xy() if self.lidar_xy is not None else None
+        if xy is None or not self.glass_spans:
+            return []
+        xy = np.asarray(xy, np.float64).reshape(-1, 2)
+        r, b = np.hypot(xy[:, 0], xy[:, 1]), np.arctan2(xy[:, 1], xy[:, 0])
+        ok = (r >= 0.28) & (r <= OBJECT_REACH_M)
+        pad, step = math.radians(LIDAR_PAD_DEG), math.radians(GLASS_BIN_DEG)
+        feet = []
+        for lo, hi in self.glass_spans:
+            sel = ok & (b >= lo - pad) & (b <= hi + pad)
+            far = {}
+            for k in np.nonzero(sel)[0]:
+                key = int(math.floor(b[k] / step))
+                if key not in far or r[k] > r[far[key]]:
+                    far[key] = k
+            line = [(float(xy[k, 0]), float(xy[k, 1])) for _, k in sorted(far.items())]
+            if len(line) >= 2:
+                feet.append(line)
+        return feet
+
+    def _wire(self, label, line, cam, pts, mask, tag):
+        """A wire on the floor along the line the VLM traced through it (pixels): each point at its
+        stereo point when the stereo measured one there, else where its ray meets the floor. A point
+        the stereo puts higher than STEREO_MIN_Z is where the wire runs up a leg or a cable tray, not on
+        the floor; consecutive floor points WIRE_JUMP_M apart are not joined. Returns a Hit or None."""
+        sel = self._usable(pts, mask=mask)
+        uv, xyz = self.stereo.uv[sel], pts[sel]
+        parts, cur, heights = [], [], []
+        for u, v in line:
+            p = None  # None: off the floor (up a leg) or out of reach
+            k = None
+            if len(uv):
+                d2 = (uv[:, 0] - u) ** 2 + (uv[:, 1] - v) ** 2
+                k = int(np.argmin(d2))
+                if d2[k] > WIRE_STEREO_PX ** 2 or math.hypot(xyz[k, 0], xyz[k, 1]) > STEREO_TRUST_M:
+                    k = None
+            if k is not None:
+                if xyz[k, 2] < STEREO_MIN_Z:
+                    p = (float(xyz[k, 0]), float(xyz[k, 1]))
+                    heights.append(float(xyz[k, 2]))
+            else:
+                f = val.pixel_to_floor(u, v, cam)
+                if f is not None and math.hypot(f[0], f[1]) <= OBJECT_REACH_M:
+                    p = (float(f[0]), float(f[1]))
+            if p is None or (cur and math.hypot(p[0] - cur[-1][0], p[1] - cur[-1][1]) > WIRE_JUMP_M):
+                if cur:
+                    parts.append(cur)
+                cur = [] if p is None else [p]
+            else:
+                cur.append(p)
+        if cur:
+            parts.append(cur)
+        if any(len(p) >= 2 for p in parts):  # a lone point past a jump is the wire up in the air, projected too far
+            parts = [p for p in parts if len(p) >= 2]
+        cells = [q for part in parts for q in _densify(part, 0.03) if not _on_body(*q)]
+        if not cells:
+            return None
+        cells.sort(key=lambda q: math.hypot(*q))
+        height = max(0.0, float(np.median(heights))) if heights else None
+        print(f"  [{tag}] 看到{label}，沿画面里的线投到地面量到最近 {math.hypot(*cells[0]):.2f} m，"
+              f"{len(parts)} 段共 {sum(len(p) for p in parts)} 个点"
+              + (f"，高约 {height:.2f} m" if height is not None else ""), flush=True)
+        return Hit(label, cells, cells, "floor", "画面里的线投到地面", height, False)
+
+    def _locate(self, label, box, cam, pts, mask, tag, line=None):
         """Where a boxed thing on the floor is.
 
         Within STEREO_TRUST_M the stereo measures it: its standing parts (STEREO_MIN_Z-STEREO_MAX_Z
@@ -556,26 +700,40 @@ class Head:
         thing not on legs only the points joined to the nearest one are its body. A thing to pick up
         is one only when it measures no longer than PICK_MAX_M.
         """
+        if line and any(k in label for k in WIRE_KEYS):
+            hit = self._wire(label, line, cam, pts, mask, tag)
+            if hit is not None:
+                return hit, np.zeros(pts.shape[:2], bool)
         sel = self._usable(pts, box, mask)
         z, rng = pts[..., 2], np.hypot(pts[..., 0], pts[..., 1])
         with np.errstate(invalid="ignore"):
             sel &= (z <= STEREO_MAX_Z) & (rng <= STEREO_TRUST_M)
             standing = sel & (z >= STEREO_MIN_Z)
+        flat = any(k in label for k in FLAT_KEYS)
         cells, how, kept = _cells(pts[standing][:, :2]), "双目", standing
-        if not cells:
+        if not cells and flat:
             cells, how, kept = _cells(pts[sel][:, :2]), "双目（贴地）", sel
         if cells:
             near = math.hypot(*cells[0])
             cells = [c for c in cells if math.hypot(*c) <= near + OBJECT_DEPTH_M]
+            measured = cells
         else:
-            cells, how = self._far(box, cam)
+            cells, how, measured = self._far(box, cam, flat)
         cells = [c for c in cells if not _on_body(*c)]
         if not cells:
             print(f"  [{tag}] 看到{label}，但双目和雷达都量不到位置，不用", flush=True)
             return None, kept
         cells.sort(key=lambda p: math.hypot(*p))
+        area = None
         if not spans(label):
             cells = _connected(cells)  # what stands behind it in the box is another thing
+        else:
+            # The nearest measured legs and what joins them; the projected box bottom is no leg.
+            legs = set(measured)
+            seat = _connected([c for c in cells if c in legs], SEAT_GAP_M)
+            if len(seat) >= 3:
+                hull = cv2.convexHull(np.asarray(seat, np.float32)).reshape(-1, 2)
+                area = [[(float(x), float(y)) for x, y in hull]]
         near = math.hypot(*cells[0])
         zs = None
         if how == "双目":
@@ -592,7 +750,7 @@ class Head:
             else:
                 print(f"  [{tag}] {label}量到长 {length:.2f} m，比夹爪能夹的 {PICK_MAX_M:.2f} m 大，当障碍",
                       flush=True)
-        return Hit(label, cells, cells, kind, how, height, top_cut), kept
+        return Hit(label, cells, cells, kind, how, height, top_cut, area), kept
 
     def _height(self, box, cam, r, zs=None):
         """(metres, top_cut) up to the top of a boxed thing whose front is r away: where the ray through
@@ -600,8 +758,9 @@ class Head:
         x1, y1, x2, _ = box
         rays = self._rays(cam, x1, x2, y1)
         height = float(cam["T_base_cam"][2, 3]) + max(rise for _, rise in rays) * r if rays else 0.0
-        if zs is not None and len(zs):
-            height = max(height, float(np.max(zs)))
+        top = _top(zs) if zs is not None else None
+        if top is not None:
+            height = max(height, top)
         return max(0.0, height), y1 <= EDGE_PX
 
     def _bottom_error(self, cam, r):
@@ -609,8 +768,11 @@ class Head:
         h = float(cam["T_base_cam"][2, 3])
         return BOX_EDGE_M + BOX_EDGE_PX / float(cam["K"][0, 0]) * (h * h + r * r) / h
 
-    def _far(self, box, cam):
-        """(cells, how) of a boxed thing the stereo did not measure within STEREO_TRUST_M.
+    def _far(self, box, cam, flat=True):
+        """(cells, how, measured) of a boxed thing the stereo did not measure within STEREO_TRUST_M:
+        measured are the lidar returns among the cells, the rest is the projected box bottom. A thing
+        that stands, once the lidar ranges it, is the lidar returns alone: the box bottom is only
+        good to BOX_EDGE_PX and would put it nearer than it is.
 
         The box bottom, projected onto the floor, is where the thing stands. Lidar returns in the
         box's bearings are the thing only when they agree with that: no nearer than the bottom line
@@ -636,8 +798,10 @@ class Head:
         if own:
             rl = min(math.hypot(*p) for p in own)
             own = [p for p in own if math.hypot(*p) <= rl + OBJECT_DEPTH_M]
-            return (own, "雷达（框伸出画面下沿）") if cut else (_densify(line, 0.04) + own, "框底投到地面，雷达对上")
-        return ([], "") if cut else (_densify(line, 0.04), "框底投到地面")
+            if cut or not flat:
+                return own, "雷达（框伸出画面下沿）" if cut else "框底投到地面，按雷达", own
+            return _densify(line, 0.04) + own, "框底投到地面，雷达对上", own
+        return ([], "", []) if cut else (_densify(line, 0.04), "框底投到地面", [])
 
     def _glass(self, label, box, pts, mask, tag):
         """Floor-standing glass or a mirror, ranged by the stereo along the box: its frame, kickboard
@@ -680,6 +844,12 @@ class Head:
         pixels used).
         """
         x1, y1, x2, y2 = box
+        # Looking up, a 0.7 m edge shows in the upper part of the picture. A box down to the image
+        # bottom holds something that goes on below the picture to the floor: it stands there (in
+        # the 30 Oct logs all 3 such boxes were a sill wall or a cabinet base, none of 220 others).
+        if y2 >= cal.HEIGHT - EDGE_PX:
+            print(f"  [{tag}] {label}的框一直到画面下沿，是立在地上的东西，不是伸在上方的，交给雷达和双目", flush=True)
+            return None, np.zeros(self.stereo.uv.shape[:2], bool)
         z_cam = float(cam["T_base_cam"][2, 3])
         rays = self._rays(cam, x1, x2, min(y2, cal.HEIGHT - 1))
         cells, kept = self._footprint(pts, (x1, y1, x2, cal.HEIGHT - 1), mask, reach=STEREO_TRUST_M)
@@ -689,8 +859,24 @@ class Head:
                    if lo <= math.atan2(py, px) <= hi and math.hypot(px, py) >= 0.28]
         support += [(math.atan2(py, px), math.hypot(px, py), px, py, True)
                     for px, py in self._lidar_in(rays, OVERHEAD_PAD_DEG)]
+        # The wheels of a chair already known there are that chair's, not legs of a desk seen beyond it.
+        if support and self.taken is not None and self.where is not None:
+            x0, y0, yaw = self.where
+            c, s_ = math.cos(yaw), math.sin(yaw)
+            on = self.taken([(x0 + c * p[2] - s_ * p[3], y0 + s_ * p[2] + c * p[3]) for p in support])
+            if any(on):
+                print(f"  [{tag}] {label}下面有 {int(sum(on))} 个点落在已认出的别的东西上，不算它的支撑", flush=True)
+                support = [p for p, t in zip(support, on) if not t]
         if not support:
             print(f"  [{tag}] 看到{label}悬在前方，但这些方向上雷达和双目都没量到东西，量不出距离，不用", flush=True)
+            return None, kept
+        # Furniture over open floor stands on legs, sides or a base the low lidar sees in those
+        # bearings. A stray return or a few stereo cells are whatever else is near in the box: a chair
+        # beside a tray on the floor, the cardboard fence in front of desks far beyond it.
+        n_lidar = sum(1 for s in support if s[4])
+        if n_lidar < OVERHEAD_MIN_LIDAR:
+            print(f"  [{tag}] 看到{label}，但下面雷达只扫到 {n_lidar} 个点（桌腿至少要 {OVERHEAD_MIN_LIDAR} 个），"
+                  "可能是远处的或别的东西，不当成伸在上方的东西", flush=True)
             return None, kept
         near = min(s[1] for s in support)
         support = [s for s in support if s[1] <= near + OVERHEAD_DEPTH_M]
@@ -701,16 +887,17 @@ class Head:
         for b, _ in rays:
             close = [s[1] for s in support if abs(s[0] - b) <= win]
             ranges.append(min(close) if close else None)
+        # Between two held samples the edge runs straight; past the outermost support nothing holds
+        # it up and it is not there (a box wider than the table must not carry its edge over open floor).
         known = [i for i, r in enumerate(ranges) if r is not None]
         for i, r in enumerate(ranges):
             if r is None:
                 left = max((j for j in known if j < i), default=None)
                 right = min((j for j in known if j > i), default=None)
-                if left is None or right is None:
-                    ranges[i] = ranges[right if left is None else left]
-                else:
+                if left is not None and right is not None:
                     ranges[i] = ranges[left] + (ranges[right] - ranges[left]) * (i - left) / (right - left)
-        heights = [z_cam + rise * r for (_, rise), r in zip(rays, ranges)]
+        samples = [(i, b, r, z_cam + rise * r) for i, ((b, rise), r) in enumerate(zip(rays, ranges)) if r is not None]
+        heights = [z for _, _, _, z in samples]
         # Where the box bottom comes out lower than STEREO_MIN_Z it meets the floor: there the box
         # holds the foot of something standing (a low wall under a windowsill, a cabinet side), not an
         # edge over open floor. Mostly so, and the box is no overhead thing at all.
@@ -719,22 +906,52 @@ class Head:
             print(f"  [{tag}] {label}的下沿量到贴着地面（离地约 {float(np.median(heights)):.2f} m），"
                   "是立在地上的东西，不是悬空的，交给雷达和双目", flush=True)
             return None, kept
-        used = [(b, r, z) for (b, _), r, z in zip(rays, ranges, heights) if STEREO_MIN_Z <= z <= STEREO_MAX_Z]
+        used = [(i, b, r, z) for i, b, r, z in samples if OVERHANG_MIN_Z <= z <= STEREO_MAX_Z]
         if not used:
-            print(f"  [{tag}] {label}的下沿量到离地 {min(z for z in heights if z >= STEREO_MIN_Z):.2f} m，高过车身，"
-                  "能从下面过", flush=True)
+            top = max(heights)
+            if top > STEREO_MAX_Z:
+                print(f"  [{tag}] {label}的下沿量到离地 {top:.2f} m，高过车身，能从下面过", flush=True)
+            else:
+                print(f"  [{tag}] {label}的下沿量到离地只有 {top:.2f} m，不像伸在上方的东西（底座，或远处的东西"
+                      "被拿前面的东西当了支撑），交给雷达和双目", flush=True)
             return None, kept
-        edge = [(r * math.cos(b), r * math.sin(b)) for b, r, _ in used]
+        edge = [(r * math.cos(b), r * math.sin(b)) for _, b, r, _ in used]
         # Only what holds up the kept part of the edge belongs to it.
-        support = [s for s in support if any(abs(s[0] - b) <= win for b, _, _ in used)]
+        support = [s for s in support if any(abs(s[0] - b) <= win for _, b, _, _ in used)]
+        # Under the edge, in each sample's own bearing, the floor back to the farthest support there
+        # is under the top. Neighbouring samples join into bands; no outline is drawn round the whole
+        # look, which would take in free floor between things standing in different bearings.
+        back, held = {}, {}
+        for i, b, r, _ in used:
+            depth = [s[1] - r for s in support if abs(s[0] - b) <= win and r <= s[1] <= r + OVERHEAD_DEPTH_M]
+            if depth:
+                held[i] = max(depth)
+        for i, b, r, _ in used:  # between two measured depths the floor under the top runs straight, like the edge
+            left = max((j for j in held if j <= i), default=None)
+            right = min((j for j in held if j >= i), default=None)
+            if left is None or right is None:
+                extra = 0.0
+            elif left == right:
+                extra = held[i]
+            else:
+                extra = held[left] + (held[right] - held[left]) * (i - left) / (right - left)
+            back[i] = (b, r, r + extra)
+        area = []
+        for i, (b, r, d) in sorted(back.items()):
+            near_i, far_i = (r * math.cos(b), r * math.sin(b)), (d * math.cos(b), d * math.sin(b))
+            if i + 1 in back:
+                b2, r2, d2 = back[i + 1]
+                area.append([near_i, (r2 * math.cos(b2), r2 * math.sin(b2)), (d2 * math.cos(b2), d2 * math.sin(b2)), far_i])
+            elif i - 1 not in back:
+                area.append([near_i, far_i])
         if low:
             print(f"  [{tag}] {label}的下沿有 {low} 处贴着地面，那几处不算", flush=True)
         points = sorted(_densify(edge, 0.04) + [(s[2], s[3]) for s in support], key=lambda p: math.hypot(*p))
         n_lidar = sum(1 for s in support if s[4])
-        height = float(np.median([z for _, _, z in used]))
+        height = float(np.median([z for _, _, _, z in used]))
         print(f"  [{tag}] 看到{label}伸在前方：下面雷达 {n_lidar} 个点、双目 {len(support) - n_lidar} 格，"
-              f"前沿最近 {min(r for _, r, _ in used):.2f} m，下沿离地约 {height:.2f} m", flush=True)
-        return Hit(label, points, points, "overhead", "雷达+双目", height, False), kept
+              f"前沿最近 {min(r for _, _, r, _ in used):.2f} m，下沿离地约 {height:.2f} m", flush=True)
+        return Hit(label, points, points, "overhead", "雷达+双目", height, False, area), kept
 
     def _confirm(self, cells):
         """The cells (base frame) that an earlier look from another viewpoint also measured.

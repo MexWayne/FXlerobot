@@ -419,16 +419,22 @@ def _outlines(obj):
     return [obj.get("points") or [(obj["x"], obj["y"])]]
 
 
-def object_rows(objects):
-    """One line of text per modelled thing for the page beside the map: what it is and its measures.
-    Things to pick up come last, with where they lie."""
+def object_rows(objects, robot=None):
+    """One line of text per modelled thing for the page beside the map: what it is, how far it is
+    from the robot now, and its measures. Things to pick up come last, with where they lie."""
     rows = []
     for obj in sorted(objects, key=lambda o: (bool(o.get("trash")), o.get("id", 0))):
         if "length" not in obj:
             continue
         num = f"{obj['id']} {obj['label']}"
+        if robot is not None:
+            pts = [p for line in _outlines(obj) for p in line] or [(obj["x"], obj["y"])]
+            num += f"（离车 {min(math.hypot(p[0] - robot[0], p[1] - robot[1]) for p in pts):.2f} m）"
         if obj.get("trash"):
-            size = f"长 {obj['length']:.2f} m" if obj["length"] >= 0.05 else "不到 0.05 m"
+            n = obj.get("size", obj["length"])
+            size = f"长 {n:.2f} m" if n >= 0.05 else "不到 0.05 m"
+            size += f"，高约 {obj['height']:.2f} m" if obj.get("height") is not None else "，高度没量到"
+            size += "，车可以压过去" if obj.get("passable") else "，车绕开"
             rows.append({"pick": True, "text": f"{num}：{size}，在 ({obj['x']:+.2f}, {obj['y']:+.2f})"})
             continue
         size = f"{obj['length']:.2f} × {obj['width']:.2f} m" if obj["width"] >= 0.08 else f"长 {obj['length']:.2f} m（只量到一面）"
@@ -436,7 +442,9 @@ def object_rows(objects):
         if obj.get("height") is not None:
             text += f"，高{'≥' if obj.get('top_cut') else ''} {obj['height']:.2f} m"
             if obj["width"] >= 0.08:
-                text += f"，约 {obj['length'] * obj['width'] * obj['height']:.2f} m³"
+                text += f"，约{'≥' if obj.get('top_cut') else ''} {obj['length'] * obj['width'] * obj['height']:.2f} m³"
+        else:
+            text += "，高度没量到"
         rows.append({"pick": False, "text": text})
     return rows
 
@@ -453,9 +461,11 @@ def render(st):
     scale = max(1, int(round(res / PX_M)))  # pixels per map cell
     pad = 12
 
+    # Drawn as the robot sees it at the start: its heading then (map +x) points up, its left (+y)
+    # to the left, like the camera picture.
     def px(x, y):
-        return (pad + int(round((x - ox) / res * scale)),
-                pad + int(round((h - (y - oy) / res) * scale)))
+        return (pad + int(round((h - (y - oy) / res) * scale)),
+                pad + int(round((w - (x - ox) / res) * scale)))
 
     # Green is only the cleaning pass. Warm-up and explore trails keep their own colours,
     # including after those passes clear the visited cells used by the planner.
@@ -465,8 +475,8 @@ def render(st):
         colored[paint == 1] = (245, 212, 168)  # light blue, BGR
         colored[paint == 2] = (120, 190, 245)  # light orange, BGR
         colored[paint == 3] = COLORS[BODY_DONE]
-    small = np.flipud(colored)
-    big = cv2.resize(small, (w * scale, h * scale), interpolation=cv2.INTER_NEAREST)
+    small = np.ascontiguousarray(colored.transpose(1, 0, 2)[::-1, ::-1])  # rows: +x up, cols: +y left
+    big = cv2.resize(small, (h * scale, w * scale), interpolation=cv2.INTER_NEAREST)
     canvas = np.full((big.shape[0] + 2 * pad, big.shape[1] + 2 * pad, 3), 18, np.uint8)
     canvas[pad:pad + big.shape[0], pad:pad + big.shape[1]] = big
 
@@ -537,7 +547,7 @@ def render(st):
     y0 = math.floor((y0 - CROP_PAD_M) / CROP_STEP_M) * CROP_STEP_M
     x1 = math.ceil((x1 + CROP_PAD_M) / CROP_STEP_M) * CROP_STEP_M
     y1 = math.ceil((y1 + CROP_PAD_M) / CROP_STEP_M) * CROP_STEP_M
-    (left, top), (right, bottom) = px(x0, y1), px(x1, y0)
+    (left, top), (right, bottom) = px(x1, y1), px(x0, y0)
     left, top = max(0, left), max(0, top)
     right, bottom = min(canvas.shape[1], right), min(canvas.shape[0], bottom)
     return canvas[top:bottom, left:right]

@@ -9,7 +9,8 @@
 
 1) 建图：原地慢转两圈，只用雷达建占据栅格；再分 6 个方向各停一次看一眼，用视觉认出雷达点云是什么
    （桌子、凳子……），补上雷达看不到的东西（桌面、贴地的电线和垃圾、落地玻璃）。
-2) 探索：深度优先，去已知空地和未知区域的交界。每到一个新地方自转一圈：雷达补图，视觉给物体建模。
+2) 探索：深度优先，车身要到每一片能到的空地附近（1 m 内），也去已知空地和未知区域的交界。
+   每到一个新地方自转一圈：雷达补图，视觉给物体建模。
 3) 清扫：按地图让车身扫过所有能到的空地，到 90% 结束。
 定位：IMU 管转向；每次停车用雷达点云和已建的地图匹配，校正位置和航向。
 行驶：每走 0.35 m 停车看一次：抬头看桌面这类伸在上方的东西，低头看地上的东西、电线、插线板和障碍。
@@ -32,8 +33,8 @@ import numpy as np  # noqa: E402
 
 from coverage_plan import ban_goal, explore_goal, route_to  # noqa: E402
 from live_map import MapView  # noqa: E402
-from occmap import BODY_CLEARANCE_M, BODY_LENGTH_M, BODY_WIDTH_M, OccMap  # noqa: E402
-from vln_scene import CLUSTER_GAP_M, spans  # noqa: E402
+from occmap import BODY_CLEARANCE_M, BODY_LENGTH_M, BODY_WIDTH_M, OccMap, disk  # noqa: E402
+from vln_scene import PICK_KEYS, PICK_MAX_M  # noqa: E402
 
 MAP_DIR = os.path.join(HERE, "map")
 
@@ -58,6 +59,11 @@ SLIP0 = 0.85          # real / commanded distance on this carpet before the lida
 SLIP_MIN_M = 0.06     # moves shorter than this do not update it
 STUCK_FRAC = 0.25     # a move covering less than this share of the command did not move
 STUCK_MOVES_MAX = 3   # stop the whole run after this many stuck moves in a row
+PASS_OVER_M = 0.05    # things to pick up no higher than this are driven over (paper scraps measured 0.04 m)
+UNSTICK_LIN = 0.16    # m/s: after a slip the zig-zag goes this fast (twice LIN) to get the wheels over it
+ZIG_DEG = 30.0        # zig-zag pieces this far either side of the way
+ZIG_PIECE_M = 0.10
+ZIG_PIECES = 6
 LOCATE_TURNS = 2      # lidar turns matched against the map at each stop
 MATCH_WIN_M = 0.10    # pose search window: this much plus MATCH_WIN_PER_M of the distance driven
 MATCH_WIN_PER_M = 0.5
@@ -70,14 +76,31 @@ TURN_SPARE = 0.05     # anything inside the turning circle plus this stops a tur
 TURN_LOOK_DEG = 30.0  # turn in steps the head (NECK_SIDE_MAX plus half the camera view) can look ahead of
 TURN_CHECK_DEG = 15.0  # smaller turns barely move the corners
 NECK_SIDE_MAX = 15.0  # wider head turns bring the body's own uprights into view
+SLIDE_MAX_DEG = 75.0  # unable to turn, the body slides towards legs this far off its heading (the lidar sees about +-80 deg)
+BLIND_SLIDE_M = 0.30  # farther round, where the lidar does not see, only this far and only as far as the map is free
+STEP_OUT_DEG = 15     # directions tried when the planned way is closed
+STEP_OUT_MIN_M = 0.10  # a direction is open when the body can move at least this far
 PERSON_LIFE_S = 20.0  # people walk away; their marks expire
 STUCK_LIFE_S = 120.0  # a spot the wheels could not cross blocks this long
 CLEAR_GAP_M = 0.10    # floor the stereo saw this close to something it saw does not clear marks
-THIN_KEYS = ("线", "绳", "插线板", "充电器")  # flat and long: block where measured, no rectangle
 OBJECT_KEEP = 1500    # points kept per modelled thing (3 cm apart: a few square metres of furniture)
 FIT_NOISE_M = 0.02    # a point this close to a side of its rectangle counts as on it (lidar range noise)
-EXPLORE_VIEW_M = 1.0  # unknown floor this close to a spot counts for going there
-EXPLORE_MIN_GAIN = 6
+GLASS_JOIN_M = 0.30   # neighbouring points of a glass foot this close are one stretch of it
+GLASS_BEHIND_M = 0.08  # seen this far past the foot of glass or a mirror: behind the glass or in the mirror
+GLASS_KEEP = 300      # glass feet remembered
+# One place, one thing. FOOT_M: a thing's footprint is its points grown by the error of placing them (a box
+# bottom projected 1.5 m out is about 0.09 m off, vln_scene._bottom_error). A look covering NMS_OVERLAP of
+# the smaller footprint is the same thing; under another name only if neither is NMS_SIZE_RATIO times bigger.
+FOOT_M = 0.10
+NMS_OVERLAP = 0.5
+NMS_SIZE_RATIO = 4.0
+OVERHANG_KEYS = ("桌", "柜", "书架", "货架", "隔板")  # things whose top reaches over the floor
+HOW_WEIGHT = {"双目": 3, "雷达+双目": 3, "双目（贴地）": 2, "框底投到地面，雷达对上": 2, "框底投到地面，按雷达": 2,
+              "雷达（框伸出画面下沿）": 2, "画面里的线投到地面": 2, "框底投到地面": 1}  # a name's vote by how the look measured the thing
+EXPLORE_VIEW_M = 1.0  # unknown or unvisited floor this close to a spot counts for going there (stereo range)
+OPEN_FLOOR_M = 0.5    # free floor narrower than this is lidar rays through gaps, not floor to go to
+EXPLORE_MIN_GAIN_M2 = 0.015  # a goal worth going to first has this much to do within EXPLORE_VIEW_M
+SWEEP_MIN_GAIN_M2 = 0.01  # likewise for a sweep goal, within half a brush
 SURVEY_BAN_M = 0.5    # after a survey turn no new goal this close to it
 GOAL_TRIES = 2
 STILL_LEGS_MAX = 4    # legs in a row that leave the body where it was: look again at what pins it
@@ -139,6 +162,7 @@ class Mover:
         self.stage = ""
         self.look = None        # (pose, time, base-frame points) of the last look
         self.objects = []       # things the cameras named and measured, map frame (remember)
+        self.glass = []         # feet of windows and mirrors seen, map-frame polylines
         self.next_id = 0
         self.survey_at = None
         self.still = 0
@@ -293,7 +317,7 @@ class Mover:
             self.view.scan_points = [to_map(self.pose, p) for p in xy[::2]]
 
     # --- straight moves --------------------------------------------------------------------
-    def drive(self, rel, dist, status, record=True, guard=True):
+    def drive(self, rel, dist, status, record=True, guard=True, speed=LIN, count_stuck=True):
         """Move `dist` m towards `rel` rad from the heading, holding the heading (omni wheels).
 
         The lidar watches the strip the body is about to cover while it moves (only in its view,
@@ -307,9 +331,9 @@ class Mover:
             del self.trail[:-TRAIL_KEEP]
         x0, y0 = self.x, self.y
         target = self.hold if self.hold is not None else self.imu_yaw()
-        vx, vy = LIN * math.cos(rel), LIN * math.sin(rel)
+        vx, vy = speed * math.cos(rel), speed * math.sin(rel)
         t0 = last = time.time()
-        span = dist / LIN
+        span = dist / speed
         try:
             while True:
                 now = time.time()
@@ -321,7 +345,7 @@ class Mover:
                 if abs(err) > HOLD_ABORT_DEG:
                     self.base.stop()
                     raise SystemExit(f"直行时航向突然偏了 {err:+.0f}°（IMU 跳变 {self.imu.jumps} 次），停车")
-                ahead = self.slip * LIN * (now - last)
+                ahead = self.slip * speed * (now - last)
                 last = now
                 self.x += ahead * math.cos(self.yaw + rel)
                 self.y += ahead * math.sin(self.yaw + rel)
@@ -334,7 +358,7 @@ class Mover:
                 time.sleep(0.05)
         finally:
             self.base.stop()
-        commanded = LIN * min(time.time() - t0, span)
+        commanded = speed * min(time.time() - t0, span)
         time.sleep(0.1)
         located = self.locate(MATCH_WIN_M + MATCH_WIN_PER_M * commanded)
         a = target + rel
@@ -342,13 +366,13 @@ class Mover:
         if located and commanded >= SLIP_MIN_M:
             self.slip = min(1.2, max(0.3, 0.5 * self.slip + 0.5 * moved / commanded))
         self.stuck = located and commanded >= SLIP_MIN_M and moved < STUCK_FRAC * commanded
-        if self.stuck:
+        if self.stuck and count_stuck:
             self.stuck_moves += 1
             print(f"  命令 {commanded:.2f} m，雷达量到只走了 {moved:.2f} m，车卡住了", flush=True)
             if self.stuck_moves >= STUCK_MOVES_MAX:
                 raise SystemExit(f"车连着 {self.stuck_moves} 次动不了：轮子在转，雷达看车几乎没动。"
                                  "检查电池电量、轮子是否打滑、底盘有没有被线或家具卡住")
-        elif moved > 0.03:
+        elif moved > 0.03 and not self.stuck:
             self.stuck_moves = 0
         self._passed_line(x0, y0)
         return max(0.0, moved)
@@ -434,18 +458,26 @@ def look(mover, head, d_yaw=0.0, near_only=False):
     Floor the stereo measured clears older camera marks there. Floor-standing glass stops lidar
     rays; people block for PERSON_LIFE_S; small things to pick up are marked apart and driven round;
     everything else blocks until the cameras see the floor free again. Named things are modelled
-    (remember) and their rectangles block as well.
+    (remember) and what their looks measured blocks as well. What lies behind a window or mirror
+    seen now or before is left out: it is seen through the glass or in the mirror.
     """
     pose = mover.pose
     mover.show("停车看前方")
+    head.taken = lambda pts: taken(mover, pts)
     hits = head.lane(d_yaw=d_yaw, near_only=near_only, where=pose)
+    new = [[to_map(pose, p) for p in line] for line in head.last_glass]
+    new += [[to_map(pose, p) for p in h.points] for h in hits if h.kind == "glass"]
+    if new:
+        mover.glass = (mover.glass + new)[-GLASS_KEEP:]
+        drop_behind_glass(mover, pose, new)
+    hits = through_glass(mover, pose, hits)
     now = time.monotonic()
     mover.look = (pose, now, [p for h in hits for p in h.points])
     cmap = mover.cmap
     marks = [to_map(pose, p) for h in hits for p in h.points]
     floor = [to_map(pose, p) for p in head.last_floor]
+    floor = [q for q, b in zip(floor, behind_glass(mover.glass, pose, floor)) if not b]
     if floor:
-        cmap.mark_floor(floor)
         seen = cmap.mask_of(floor, 0.0)
         if marks:
             seen &= ~cmap.mask_of(marks, CLEAR_GAP_M)
@@ -457,16 +489,78 @@ def look(mover, head, d_yaw=0.0, near_only=False):
         if h.kind == "glass":
             cmap.mark_glass(pts)
         elif h.kind == "trash":
-            cmap.mark_trash(pts)
+            cmap.mark_trash(pts, passable=h.height is not None and h.height <= PASS_OVER_M)
         elif h.kind == "person":
             cmap.block(pts, 0.05, now + PERSON_LIFE_S)
         else:
             cmap.block(pts, 0.03, math.inf)
         if h.kind in ("floor", "overhead", "trash") and pts:
-            remember(mover, h, pts)
+            remember(mover, h, pts, [[to_map(pose, p) for p in band] for band in h.area or []])
     block_objects(mover)
     show_objects(mover)
     return hits
+
+
+def behind_glass(lines, pose, pts):
+    """For map points `pts`: True where the sight line from the body (pose) crosses the foot of a known
+    window or mirror and the point lies more than GLASS_BEHIND_M past it."""
+    pts = np.asarray(pts, np.float64).reshape(-1, 2)
+    out = np.zeros(len(pts), bool)
+    seg = [(a, b) for line in lines for a, b in zip(line, line[1:])
+           if math.hypot(b[0] - a[0], b[1] - a[1]) <= GLASS_JOIN_M]
+    if not seg or not len(pts):
+        return out
+    a = np.array([s[0] for s in seg], np.float64)
+    e = np.array([s[1] for s in seg], np.float64) - a
+    o = np.array(pose[:2], np.float64)
+    d = pts - o                                                   # N x 2 sight lines
+    ao = a - o                                                    # M x 2
+    den = d[:, None, 0] * e[None, :, 1] - d[:, None, 1] * e[None, :, 0]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t = (ao[None, :, 0] * e[None, :, 1] - ao[None, :, 1] * e[None, :, 0]) / den
+        u = (ao[None, :, 0] * d[:, None, 1] - ao[None, :, 1] * d[:, None, 0]) / den
+    past = (1.0 - t) * np.hypot(d[:, 0], d[:, 1])[:, None]
+    cross = (np.abs(den) > 1e-12) & (t > 0.0) & (t < 1.0) & (u >= 0.0) & (u <= 1.0) & (past > GLASS_BEHIND_M)
+    return cross.any(axis=1)
+
+
+def through_glass(mover, pose, hits):
+    """The hits less what lies behind a known window or mirror: seen through it or in it, not here."""
+    out = []
+    for h in hits:
+        if h.kind == "glass" or not h.points:
+            out.append(h)
+            continue
+        here = [p for p, b in zip(h.points, behind_glass(mover.glass, pose, [to_map(pose, p) for p in h.points])) if not b]
+        if len(here) < len(h.points):
+            print(f"  {h.label}有 {len(h.points) - len(here)} 个点在玻璃或镜子后面，是透过去或映出来的，不算", flush=True)
+        if here:
+            keep = set(here)
+            out.append(h._replace(points=here, sure=[p for p in h.sure if p in keep]))
+    return out
+
+
+def drop_behind_glass(mover, pose, lines):
+    """Things modelled earlier that lie behind newly seen glass, seen from here: not in the room. Their
+    model goes and the camera marks under them are cleared (the lidar marks stay)."""
+    for obj in list(mover.objects):
+        behind = behind_glass(lines, pose, obj["points"])
+        if behind.mean() > 0.5:
+            n = mover.cmap.clear_vis(mover.cmap.mask_of(obj["points"], 0.03))
+            mover.objects.remove(obj)
+            print(f"  {obj['id']} 号{obj['label']}在玻璃或镜子后面，不是房间里的东西，删掉（清掉 {n} 格视觉标记）",
+                  flush=True)
+
+
+def taken(mover, pts):
+    """For map points: True on the footprint of a known thing that stands on the floor (a chair, a
+    box, a bag), so a lidar return there is not a leg of a desk or shelf seen beyond it."""
+    pts = list(pts)
+    feet = [o["foot"] for o in mover.objects if not any(k in o["label"] for k in OVERHANG_KEYS)]
+    if not feet or not pts:
+        return [False] * len(pts)
+    cells = [mover.cmap.world_to_cell(x, y) for x, y in pts]
+    return [c is not None and any(f[c] for f in feet) for c in cells]
 
 
 def _thin(points, cell=0.03, keep=OBJECT_KEEP):
@@ -498,87 +592,164 @@ def _rect(points):
     return [(float(x), float(y)) for x, y in corners], max(span1, span2), min(span1, span2), heading
 
 
-def _joins(obj, arr):
-    """True when look points `arr` belong to modelled thing `obj` (same name checked by the caller):
-    they come within CLUSTER_GAP_M of its points, or, for a thing on legs, fall inside its rectangle
-    (looks from under a table see other legs of it)."""
-    old = np.asarray(obj["points"])
-    if np.sqrt(((old[:, None, :] - arr[None, :, :]) ** 2).sum(-1)).min() <= CLUSTER_GAP_M:
-        return True
-    if obj["spans"] and len(obj["rect"]) == 4:
-        rect = np.asarray(obj["rect"], np.float32).reshape(-1, 1, 2)
-        return any(cv2.pointPolygonTest(rect, (float(x), float(y)), True) >= -CLUSTER_GAP_M for x, y in arr)
-    return False
+def _fill(cmap, poly):
+    """Cells of a polygon (map frame); a point or a line still takes the cells it touches."""
+    mask = np.zeros((cmap.h, cmap.w), np.uint8)
+    px = np.round(np.array([[(x - cmap.origin[0]) / cmap.res - 0.5, (y - cmap.origin[1]) / cmap.res - 0.5]
+                            for x, y in poly])).astype(np.int32)
+    if len(px) >= 3:
+        cv2.fillPoly(mask, [px], 1)
+    cv2.polylines(mask, [px], len(px) >= 3, 1, 1)
+    return mask > 0
 
 
-def remember(mover, hit, pts):
-    """Model a named thing from what one look measured: its points (map frame), how high it is, and
-    from those its rectangle, length, width and heading.
+def _footprint(cmap, points):
+    """Map cells within FOOT_M of a thing's points: where it is, give or take the measuring error."""
+    return cmap.mask_of(points, FOOT_M)
 
-    A look joins a known thing of the same name it belongs to (_joins); one that belongs to several
-    makes them one. Only measured points shape a thing: of a cabinet seen from the front the
-    rectangle is its front until another look measures its side.
+
+def _covers_stood(cmap, rect):
+    """True when a rectangle lies over floor the body stood on: nothing stands there, not even the
+    top of a table, so the points in it are not one thing. Its edge cells do not count."""
+    inner = cv2.erode(_fill(cmap, rect).astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    return bool((inner & cmap.stood).any())
+
+
+def _same(cmap, obj, label, foot, points):
+    """True when a footprint (of `points`) is the thing `obj`.
+
+    Non-maximum suppression on the floor plan: most of the smaller of the two lies in the other. Under
+    another name a much smaller one is a thing of its own lying by or under the bigger one (a power
+    strip under a desk). Under the same name footprints that only touch are faces of one thing (the
+    front and the side of a cabinet). Never when together they would lie over floor the body stood
+    on: two desks with the robot between them stay two desks.
     """
-    arr = np.asarray(pts, np.float64)
-    joins = [o for o in mover.objects if o["label"] == hit.label and _joins(o, arr)]
+    a, b = int(obj["foot"].sum()), int(foot.sum())
+    inter = int((obj["foot"] & foot).sum()) if a and b else 0
+    if not inter:
+        return False
+    if inter >= NMS_OVERLAP * min(a, b):
+        same = label == obj["label"] or max(a, b) <= NMS_SIZE_RATIO * min(a, b)
+    else:
+        same = label == obj["label"]
+    return same and not _covers_stood(cmap, _rect(obj["points"] + list(points))[0])
+
+
+def _absorb(obj, other):
+    for name, score in other["names"].items():
+        obj["names"][name] = obj["names"].get(name, 0) + score
+    obj["points"] = _thin(obj["points"] + other["points"])
+    obj["sizes"] = obj.get("sizes", []) + other.get("sizes", [])
+    obj["parts"] += other["parts"]
+    obj["seen"] += other["seen"]
+    if other["height"] is not None and (obj["height"] is None or other["height"] > obj["height"]):
+        obj["height"], obj["top_cut"] = other["height"], other["top_cut"]
+
+
+def _settle(obj, cmap):
+    """Name, measures and kind of a thing after its looks changed: the name with the most evidence."""
+    obj["label"] = max(obj["names"], key=obj["names"].get)
+    obj["foot"] = _footprint(cmap, obj["points"])
+    obj["rect"], obj["length"], obj["width"], obj["heading"] = _rect(obj["points"])
+    # Each look's own length: put together, looks placed a few cm apart spread a small thing out.
+    obj["size"] = float(np.median(obj["sizes"])) if obj.get("sizes") else obj["length"]
+    obj["trash"] = any(k in obj["label"] for k in PICK_KEYS) and obj["size"] <= PICK_MAX_M
+
+
+def remember(mover, hit, pts, area=()):
+    """Model a named thing from what one look measured: its points (map frame), the floor under it
+    the look measured (area: the bands under an overhang, map frame), how high it is, and from the
+    points its rectangle, length, width and heading.
+
+    One place holds one thing. A look whose footprint mostly lies on a known thing's (or the other
+    way round) is that thing, whatever name the VLM gave this time (_same); the names are votes
+    weighted by how well the look measured it (HOW_WEIGHT) and the thing goes by the strongest. A
+    thing that grows over another is merged with it the same way. Only measured points shape a thing:
+    of a cabinet seen from the front the rectangle is its front until another look measures its side.
+    """
+    cmap = mover.cmap
+    look = {"names": {hit.label: HOW_WEIGHT.get(hit.how, 1)}, "points": _thin(list(pts)),
+            "sizes": [_rect(list(pts))[1] if len(pts) >= 2 else 0.0],
+            "parts": [list(band) for band in area], "seen": 1, "height": hit.height, "top_cut": hit.top_cut}
+    foot = _footprint(cmap, look["points"])
+    joins = [o for o in mover.objects if _same(cmap, o, hit.label, foot, look["points"])]
     if joins:
+        joins.sort(key=lambda o: -sum(o["names"].values()))  # the thing keeps the number of its best-known part
         obj = joins[0]
         for other in joins[1:]:
-            obj["points"] += other["points"]
-            obj["seen"] += other["seen"]
-            if other["height"] is not None and (obj["height"] is None or other["height"] > obj["height"]):
-                obj["height"], obj["top_cut"] = other["height"], other["top_cut"]
+            _absorb(obj, other)
             mover.objects.remove(other)
-        if len(joins) > 1:
-            print(f"  这次量到的{hit.label}连上了已知的 {len(joins)} 个，是同一个", flush=True)
+        _absorb(obj, look)
     else:
         mover.next_id += 1
-        obj = {"id": mover.next_id, "label": hit.label, "points": [], "seen": 0, "height": None,
-               "top_cut": False, "trash": hit.kind == "trash", "spans": spans(hit.label),
-               "thin": any(k in hit.label for k in THIN_KEYS)}
+        obj = dict(look, id=mover.next_id)
         mover.objects.append(obj)
-    obj["points"] = _thin(obj["points"] + list(pts))
-    obj["seen"] += 1
-    if hit.height is not None and (obj["height"] is None or hit.height > obj["height"]):
-        obj["height"], obj["top_cut"] = hit.height, hit.top_cut
-    obj["rect"], obj["length"], obj["width"], obj["heading"] = _rect(obj["points"])
+    _settle(obj, cmap)
+    while True:  # grown, it may now cover others
+        more = [o for o in mover.objects
+                if o is not obj and _same(cmap, o, obj["label"], obj["foot"], obj["points"])]
+        if not more:
+            break
+        best = max(more, key=lambda o: sum(o["names"].values()))
+        if sum(best["names"].values()) > sum(obj["names"].values()):  # keep the better-known number
+            obj["id"], best["id"] = best["id"], obj["id"]
+        for other in more:
+            _absorb(obj, other)
+            mover.objects.remove(other)
+        joins += more
+        _settle(obj, cmap)
+    if joins:
+        others = sorted({o["id"] for o in joins} - {obj["id"]})
+        if len(obj["names"]) > 1 or others:
+            print(f"  这次量到的{hit.label}是 {obj['id']} 号{'（并进了 ' + '、'.join(map(str, others)) + ' 号）' if others else ''}，"
+                  f"各名字的分数 {obj['names']}，按 {obj['label']} 算", flush=True)
 
 
 def block_objects(mover):
-    """Rebuild the map layer of the modelled things from their rectangles.
+    """Rebuild the map layer of the modelled things: the floor under their overhangs, as measured.
 
-    A thing on legs blocks its whole rectangle: the body cannot go under its top, though the floor
-    there is bare. Of any other body, floor the stereo measured bare inside its rectangle, away from
-    its own points, is not part of it. Thin things and things to pick up block only where measured
-    (look marks those). The cells the body stood on never block (OccMap.rebuild).
+    What a thing stands on is marked where it was measured (look). On top of that a table or shelf
+    blocks the bands of floor each look measured under its edge, back to its supports in the same
+    bearing, and a chair or stool the floor between the legs one look measured: the body cannot go
+    under its top or seat though nothing stands there. No outline round a whole look or round the
+    thing, which would take in free floor; the rectangle is only its measures for the page. The
+    cells the body stood on never block (OccMap.rebuild).
     """
     cmap = mover.cmap
     layer = np.zeros((cmap.h, cmap.w), bool)
     for obj in mover.objects:
-        if obj["trash"] or obj["thin"]:
+        if obj["trash"]:
             continue
-        one = np.zeros((cmap.h, cmap.w), np.uint8)
-        px = np.array([[(x - cmap.origin[0]) / cmap.res - 0.5, (y - cmap.origin[1]) / cmap.res - 0.5]
-                       for x, y in obj["rect"]])
-        cv2.fillConvexPoly(one, np.round(px).astype(np.int32), 1)
-        one = one > 0
-        if not obj["spans"]:
-            one &= ~(cmap.floor_seen & ~cmap.mask_of(obj["points"], CLUSTER_GAP_M))
-        layer |= one
+        for part in obj["parts"]:
+            layer |= _fill(cmap, part)
     cmap.objects = layer
     cmap.rebuild()
+
+
+def _blocked_outlines(cmap, obj):
+    """Outlines (map frame) of the cells a thing blocks: where it was measured and the floor under
+    its top or seat. The page draws these, not the rectangle round all its points."""
+    cells = cmap.mask_of(obj["points"], 0.03)
+    for part in obj["parts"]:
+        cells |= _fill(cmap, part)
+    contours, _ = cv2.findContours(cells.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return [[cmap.cell_center((int(r), int(c))) for c, r in cnt.reshape(-1, 2)] for cnt in contours]
 
 
 def show_objects(mover):
     # A thing to pick up that is gone from the map (the stereo saw bare floor there) is gone from the page.
     mover.objects = [o for o in mover.objects
                      if not o["trash"] or any(mover.cmap.is_trash(x, y) for x, y in o["points"])]
+    for o in mover.objects:
+        o["outlines"] = _blocked_outlines(mover.cmap, o)
     with mover.view.lock:
-        mover.view.objects = [{"id": o["id"], "label": o["label"], "rect": o["rect"],
+        mover.view.objects = [{"id": o["id"], "label": o["label"], "outlines": o["outlines"],
                                "x": float(np.mean([p[0] for p in o["points"]])),
                                "y": float(np.mean([p[1] for p in o["points"]])),
                                "length": o["length"], "width": o["width"], "heading": o["heading"],
                                "height": o["height"], "top_cut": o["top_cut"], "trash": o["trash"],
+                               "size": o.get("size", o["length"]),
+                               "passable": o["trash"] and o["height"] is not None and o["height"] <= PASS_OVER_M,
                                "seen": o["seen"]}
                               for o in mover.objects]
 
@@ -699,8 +870,12 @@ def safe_turn(mover, head, heading, status):
 def follow(mover, head, route, status):
     """Drive the corner points of `route`, stopping to look every LOOK_M.
 
-    Returns "done", or why it stopped: "turn" (no room to turn), "blocked" (something ahead),
-    "stuck" (the wheels did not move the body) or "replan" (the map closed the way).
+    The body turns to face each leg. Where it cannot turn (something inside the turning circle) it
+    keeps its heading and slides towards the leg on its omni wheels: within SLIDE_MAX_DEG of the
+    heading, where the lidar watches the way, or farther round for a short leg (BLIND_SLIDE_M, out of
+    a tight spot onto drivable floor) as far as the map is free. Returns "done", or why it stopped:
+    "turn" (no room to turn and the leg out of sliding reach), "blocked" (something ahead), "stuck"
+    (the wheels did not move the body) or "replan" (the map closed the way).
     """
     for tx, ty in route[1:]:
         for _ in range(200):
@@ -708,26 +883,74 @@ def follow(mover, head, route, status):
             if d < 0.04:
                 break
             heading = math.atan2(ty - mover.y, tx - mover.x)
+            rel = 0.0
             if abs(wrap_deg(math.degrees(heading - mover.yaw))) > 4.0:
                 if not safe_turn(mover, head, heading, status):
-                    return "turn"
-            mover.hold = heading
-            hits = look(mover, head)
-            free = free_ahead(mover, hits)
+                    rel = math.radians(wrap_deg(math.degrees(heading - mover.yaw)))
+                    if abs(math.degrees(rel)) <= SLIDE_MAX_DEG:
+                        print(f"  转不了身，车头不动，朝 {math.degrees(rel):+.0f}° 平移过去", flush=True)
+                    elif d <= BLIND_SLIDE_M:
+                        # The lidar does not see that way; the map the turns at the start built does.
+                        print(f"  转不了身，雷达看不到 {math.degrees(rel):+.0f}° 那边，按地图平移 {d:.2f} m 到能走的地方",
+                              flush=True)
+                    else:
+                        return "turn"
+            mover.hold = heading if rel == 0.0 else mover.yaw
+            hits = look(mover, head, d_yaw=_neck(-math.degrees(rel)))
+            free = free_ahead(mover, hits, rel)
             step = min(LOOK_M, d, free)
             if step < 0.03:
-                print(f"  前方只剩 {free:.2f} m，换路", flush=True)
+                print(f"  {'前方' if rel == 0.0 else '平移方向上'}只剩 {free:.2f} m，换路", flush=True)
                 return "blocked"
-            mover.drive(0.0, step, status)
-            if mover.stuck:
-                spot = to_map(mover.pose, (BODY_LENGTH_M / 2.0 + 0.08, 0.0))
+            mover.drive(rel, step, status, count_stuck=False)
+            if mover.stuck and not zigzag(mover, rel, step, status):
+                mover.stuck_moves += 1
+                if mover.stuck_moves >= STUCK_MOVES_MAX:
+                    raise SystemExit(f"车连着 {mover.stuck_moves} 次动不了，之字形加速也没脱困：轮子在转，雷达看车几乎没动。"
+                                     "检查电池电量、轮子是否打滑、底盘有没有被线或家具卡住")
+                reach = _extent(rel)[0] + 0.08  # just past the body's edge in the way it moved
+                spot = to_map(mover.pose, (reach * math.cos(rel), reach * math.sin(rel)))
                 mover.cmap.block([spot], 0.06, time.monotonic() + STUCK_LIFE_S)
                 mover.cmap.rebuild()
                 return "stuck"
+            if rel != 0.0:
+                mover.turn_refused = False  # it got away from what kept it from turning
             cell = mover.cmap.world_to_cell(tx, ty)
             if cell is None or not mover.cmap.drive_mask[cell]:
                 return "replan"
     return "done"
+
+
+def zigzag(mover, rel, need, status):
+    """The wheels slipped on a move towards `rel`: zig-zag out, faster. Short pieces ZIG_DEG either side
+    of the way alternately at UNSTICK_LIN, each only where the lidar and the map leave room, until the
+    body has made `need` m along the way, at most ZIG_PIECES pieces. Returns True when it got through.
+    """
+    a = mover.yaw + rel
+    x0, y0 = mover.x, mover.y
+    side = 1.0
+    print(f"  打滑了：加速到 {UNSTICK_LIN:.2f} m/s，走之字形脱困", flush=True)
+    for _ in range(ZIG_PIECES):
+        way = rel + side * math.radians(ZIG_DEG)
+        room = free_ahead(mover, [], way, ZIG_PIECE_M)
+        if room < 0.03:
+            side = -side
+            way = rel + side * math.radians(ZIG_DEG)
+            room = free_ahead(mover, [], way, ZIG_PIECE_M)
+            if room < 0.03:
+                print("  之字形两边都没地方，停下", flush=True)
+                break
+        mover.drive(way, room, status, record=False, speed=UNSTICK_LIN, count_stuck=False)
+        side = -side
+        made = (mover.x - x0) * math.cos(a) + (mover.y - y0) * math.sin(a)
+        if made >= need - 0.02:
+            print(f"  之字形脱困了：沿原方向走了 {made:.2f} m", flush=True)
+            mover.stuck, mover.stuck_moves = False, 0
+            return True
+    made = (mover.x - x0) * math.cos(a) + (mover.y - y0) * math.sin(a)
+    print(f"  之字形没脱困：沿原方向只走了 {made:.2f} m", flush=True)
+    mover.stuck = True
+    return False
 
 
 def back_up(mover, dist, status):
@@ -921,29 +1144,77 @@ def recheck(mover, head):
         look(mover, head, d_yaw=d_yaw, near_only=True)
 
 
+def unvisited(cmap):
+    """Free floor the body has not been within EXPLORE_VIEW_M of (the stereo ranges well that close).
+    Only open floor counts: lidar rays reaching out through gaps (free less than OPEN_FLOOR_M wide)
+    are no floor to go to."""
+    k = max(1, int(round(OPEN_FLOOR_M / cmap.res)))
+    free = cmap.seen & ~cmap.occupied()
+    open_floor = cv2.morphologyEx(free.astype(np.uint8), cv2.MORPH_OPEN, np.ones((k, k), np.uint8)) > 0
+    near = cv2.dilate(cmap.stood.astype(np.uint8), disk(EXPLORE_VIEW_M / cmap.res)) > 0
+    return open_floor & ~near
+
+
+def step_out(mover, head, target):
+    """The planned way is closed and the body has not moved: pick a direction itself. Of the
+    directions the lidar watches (every STEP_OUT_DEG within SLIDE_MAX_DEG of the heading), the one
+    where the body can move at least STEP_OUT_MIN_M (lidar, the look and the map agree) and lands
+    nearest to the most `target` floor (within EXPLORE_VIEW_M) gets one step, the heading kept.
+    Returns True when the body moved."""
+    hits = look(mover, head)
+    cmap = mover.cmap
+    rad = max(1, int(math.ceil(EXPLORE_VIEW_M / cmap.res)))
+    gain = cv2.filter2D(target.astype(np.float32), -1, disk(rad).astype(np.float32), borderType=cv2.BORDER_CONSTANT)
+    best = None
+    for deg in range(-int(SLIDE_MAX_DEG), int(SLIDE_MAX_DEG) + 1, STEP_OUT_DEG):
+        rel = math.radians(deg)
+        room = free_ahead(mover, hits, rel, LOOK_M)
+        if room < STEP_OUT_MIN_M:
+            continue
+        cell = cmap.world_to_cell(*to_map(mover.pose, (room * math.cos(rel), room * math.sin(rel))))
+        score = (float(gain[cell]) if cell is not None else 0.0, -abs(deg))
+        if best is None or score > best[0]:
+            best = (score, rel, room)
+    if best is None or best[0][0] <= 0:
+        print("  自己找方向：雷达看得到的方向都走不出去，或那边没有没去过的地方", flush=True)
+        return False
+    _, rel, room = best
+    print(f"  规划的路走不通，自己找方向：车头不动，朝 {math.degrees(rel):+.0f}° 平移 {room:.2f} m，那边没去过的地方最多",
+          flush=True)
+    x0, y0 = mover.x, mover.y
+    mover.hold = mover.yaw
+    mover.drive(rel, room, "探索：自己找方向")
+    return math.hypot(mover.x - x0, mover.y - y0) > 0.03
+
+
 def explore(mover, head):
-    """Depth first to the frontier between known free floor and unknown, with a survey turn at
-    every new place. Ends when no frontier can be reached."""
+    """Depth first until the body has been near all the floor it can reach: to the frontier between
+    known free floor and unknown, and to free floor it has not been within EXPLORE_VIEW_M of (the
+    lidar may have seen it from afar; the body has to go there). A survey turn at every new place.
+    Ends when none of those can be reached."""
     mover.set_stage("explore")
     cmap = mover.cmap
     branches, tries = [], {}
-    said = {"ahead": "接着往前方的新地方走", "branch": "前面走到头了，退回最近的岔路",
-            "nearest": "岔路都走完了，去最近的未知边缘"}
+    said = {"ahead": "接着往前方没去过的地方走", "branch": "前面走到头了，退回最近的岔路",
+            "nearest": "岔路都走完了，去最近的没去过的地方"}
     for leg in range(MAX_LEGS):
-        frontier = cmap.frontier()
+        target = cmap.frontier() | unvisited(cmap)
         goal = None
-        for gain in (EXPLORE_MIN_GAIN, 1):
-            goal, how, reach, cut = explore_goal(cmap, mover.x, mover.y, mover.yaw, branches, frontier,
+        for gain in (max(1, round(EXPLORE_MIN_GAIN_M2 / cmap.res ** 2)), 1):
+            goal, how, reach, cut = explore_goal(cmap, mover.x, mover.y, mover.yaw, branches, target,
                                                  EXPLORE_VIEW_M, gain)
             if goal is not None:
                 break
         if goal is None:
-            print(f"阶段 2/3 探索完：能到的未知边缘都看过了（到不了的还有 {cut} 格）")
+            print(f"阶段 2/3 探索完：车身能到的地方都去过了（车身到不了的还有 {cut * cmap.res ** 2:.1f} m²）")
             return
         gx, gy = cmap.cell_center(goal)
         print(f"探索第 {leg + 1} 段：深度优先，{said[how]} ({gx:+.2f}, {gy:+.2f})，"
-              f"还有 {reach} 格未知边缘能去", flush=True)
+              f"还有 {reach * cmap.res ** 2:.1f} m² 没去过的地方能去", flush=True)
+        x0, y0 = mover.x, mover.y
         if not go(mover, head, goal, tries, "探索"):
+            if math.hypot(mover.x - x0, mover.y - y0) < 0.05:
+                step_out(mover, head, target)
             continue
         last = mover.survey_at
         if last is None or math.hypot(mover.x - last[0], mover.y - last[1]) >= SURVEY_GAP_M:
@@ -966,7 +1237,7 @@ def sweep(mover, head):
             return "done"
         todo = cmap.sweepable() & ~cmap.swept
         goal = None
-        for gain in (4, 1):
+        for gain in (max(1, round(SWEEP_MIN_GAIN_M2 / cmap.res ** 2)), 1):
             goal, how, reach, cut = explore_goal(cmap, mover.x, mover.y, mover.yaw, branches, todo,
                                                  cmap.body_brush * 0.5, gain)
             if goal is not None:

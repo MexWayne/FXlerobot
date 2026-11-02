@@ -32,7 +32,7 @@ def _flood(mask, start):
     return dist
 
 
-def start_cell(cmap, x, y, reach_m=0.8, min_cells=50):
+def start_cell(cmap, x, y, reach_m=0.8, min_m2=0.125):
     """Drivable cell the robot drives from: its own, or a nearby one with room to go somewhere.
 
     A freshly marked obstacle can cover the robot's own cell; the nearest free cell may then be a
@@ -55,7 +55,7 @@ def start_cell(cmap, x, y, reach_m=0.8, min_cells=50):
         if tried[cell]:
             continue
         part = _flood(mask, cell) >= 0
-        if int(part.sum()) >= min_cells:
+        if int(part.sum()) * cmap.res ** 2 >= min_m2:
             return cell
         tried |= part
     return int(ys[order[0]]), int(xs[order[0]])

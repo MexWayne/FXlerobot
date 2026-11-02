@@ -76,7 +76,7 @@ class Cache:
         return {"status": status, "stage": st.get("stage", ""), "running": running,
                 "when": f"更新于 {when}", "has_map": st.get("has_map", False),
                 "sweep": st.get("sweep", 0.0), "furniture": st.get("furniture", []), "version": version,
-                "objects": object_rows(st.get("objects") or [])}
+                "objects": object_rows(st.get("objects") or [], st.get("robot"))}
 
 
 def main():
