@@ -44,8 +44,12 @@ MAX_RANGE_M = 3.0
 # Neck axes in the base frame (m), fitted on 2026-10-19 by matching floor features across neck poses.
 # neck_yaw.pos + turns the head right about a vertical axis; neck_pitch.pos + tilts it down about
 # a lateral axis. Both servos turn the camera 1:1 in degrees.
+# Floor features fix the view directions but hardly the height: at pitch 35.6 the left eye came out
+# 32 mm too low (a ChArUco board lying on the floor, its surface 14.4 mm up, read -18 mm). PIVOT_PITCH
+# was moved (+50 mm x, +16 mm z, 2026-11-02) so the camera sits that much higher there with x
+# unchanged (x already agreed with the lidar); pitch 0, the extrinsic calibration pose, is unchanged.
 PIVOT_YAW = np.array([-0.017, -0.011, 0.666])
-PIVOT_PITCH = np.array([0.023, -0.011, 0.666])
+PIVOT_PITCH = np.array([0.073, -0.011, 0.682])
 
 PROMPT = """你是机器人的视觉定位模块，图像来自机器人头部相机。
 用户指令：{instruction}

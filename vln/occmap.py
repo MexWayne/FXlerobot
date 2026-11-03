@@ -19,6 +19,8 @@ import math
 import cv2
 import numpy as np
 
+from lidar_scan import LIDAR_X_M, LIDAR_Y_M
+
 UNKNOWN, BODY_REACH, ARM_ONLY, BODY_DONE, ARM_DONE, BLOCKED, TRASH = range(7)
 
 BODY_LENGTH_M = 0.30
@@ -139,8 +141,12 @@ class OccMap:
         xy = np.asarray(xy, np.float64).reshape(-1, 2)
         if not len(xy):
             return
-        x0, y0, yaw = pose
+        # Rays start at the lidar (LIDAR_X_M ahead of the base centre, LIDAR_Y_M to the side), not at
+        # the centre itself.
+        xb, yb, yaw = pose
         c, s = math.cos(yaw), math.sin(yaw)
+        x0, y0 = xb + c * LIDAR_X_M - s * LIDAR_Y_M, yb + s * LIDAR_X_M + c * LIDAR_Y_M
+        xy = xy - (LIDAR_X_M, LIDAR_Y_M)
         r = np.hypot(xy[:, 0], xy[:, 1])
         ux = (c * xy[:, 0] - s * xy[:, 1]) / r
         uy = (s * xy[:, 0] + c * xy[:, 1]) / r

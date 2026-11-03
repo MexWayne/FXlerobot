@@ -1,4 +1,5 @@
-"""RPLIDAR on the robot. One full turn is a set of points in the base frame: x forward, y left.
+"""RPLIDAR on the robot. One full turn is a set of points in the base frame: x forward, y left,
+origin at the base centre (the lidar itself is LIDAR_X_M ahead of it and LIDAR_Y_M to the side).
 
 Floor-standing glass and mirrors are not in these points: a return there is a reflection or what
 stands behind. The map stops rays where the stereo measured such glass (occmap.OccMap.insert_scan).
@@ -18,6 +19,15 @@ RMIN, RMAX = 0.25, 12.0
 # The body blocks the lidar behind: back there it only returns the robot itself (a steady 0.26 m
 # echo at -140°) or nothing. Returns farther round from the nose than this are dropped.
 VIEW_DEG = 100.0
+# The lidar sits this far ahead of the base centre (measured, 2026-11-02). RMIN and VIEW_DEG apply in
+# the lidar's own frame; the points handed out are moved into the base frame. Checked against the
+# head cameras: the left arm seen by both was 12 cm apart in x before this shift.
+LIDAR_X_M = 0.12
+# The lidar is also off the centre line, to the right. A tape cannot reach it from the side, so this
+# is fitted (2026-11-02): two cups seen by the lidar and by the head stereo were 2.4 cm apart in y
+# and agreed in x once the lidar moved this far right. The same cups, located on the ChArUco board
+# whose near squares are 47.5 mm from the bumper, put the lidar 45 mm behind the bumper.
+LIDAR_Y_M = -0.024
 
 
 def find_port():
@@ -129,7 +139,7 @@ class Lidar:
         ang = -np.deg2rad(scan[:, 0])
         front = np.abs(np.arctan2(np.sin(ang), np.cos(ang))) <= np.deg2rad(VIEW_DEG)
         ang, dist = ang[front], scan[front, 1]
-        xy = np.c_[dist * np.cos(ang), dist * np.sin(ang)]
+        xy = np.c_[dist * np.cos(ang) + LIDAR_X_M, dist * np.sin(ang) + LIDAR_Y_M]
         with self._lock:
             self._xy = xy
             self._stamp = time.time()
