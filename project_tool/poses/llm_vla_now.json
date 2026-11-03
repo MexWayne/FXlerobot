@@ -1,0 +1,26 @@
+{
+  "name": "llm_vla_now",
+  "saved_at": "2026-11-02T16:11:14",
+  "arms": {
+    "left": {
+      "shoulder_pan": 2057,
+      "shoulder_lift": 2931,
+      "elbow_flex": 2268,
+      "wrist_flex": 2157,
+      "wrist_roll": 1066,
+      "gripper": 1289
+    },
+    "right": {
+      "shoulder_pan": 1581,
+      "shoulder_lift": 798,
+      "elbow_flex": 1146,
+      "wrist_flex": 3086,
+      "wrist_roll": 2049,
+      "gripper": 751
+    }
+  },
+  "neck": {
+    "neck_yaw": 1887,
+    "neck_pitch": 2528
+  }
+}
