@@ -3,7 +3,8 @@
 
     python mount.py        # -> arm_mount.yaml
 
-Each touch gives the tip in the arm base frame (SO-101 kinematics) and, through the board pose and
+Each touch gives the tip in the arm base frame (SO-101 kinematics, from the joint angles recorded at
+the touch, so a change to so101_kin counts) and, through the board pose and
 the head camera chain (head_extrinsic.yaml + vln_nav.cam_at), the same point in the base frame.
 The arm base is taken as level, so the fit is a yaw and a translation. Touches come from
 arm_snapshot.py folders that saw the board and from touch_calib.py.
@@ -21,6 +22,7 @@ import yaml
 HERE = Path(__file__).resolve().parent
 LLM_VLA = HERE.parent
 sys.path[:0] = [str(LLM_VLA), str(LLM_VLA.parent / "project_tool"), str(LLM_VLA.parent / "vln")]
+import so101_kin  # noqa: E402
 import validate_head_extrinsic as val  # noqa: E402
 from vln_nav import cam_at  # noqa: E402
 
@@ -40,14 +42,14 @@ def touches(cams, extr):
     for snap, (c, r) in SNAPSHOT_TOUCHES.items():
         s = json.loads((LLM_VLA / "snapshots" / snap / "snapshot.json").read_text())
         out.append((f"{snap} ({c},{r})", base_point(cams, extr, s["neck_deg"], s["left"]["T_cam_board"], c, r),
-                    np.array(s["tip_in_arm_base_m"])))
+                    so101_kin.tip_position(s["left_arm_deg"])))
     session = LLM_VLA / "calib" / "touch" / "session.json"
     if session.is_file():
         s = json.loads(session.read_text())
         for t in s["touches"]:
             out.append((f"touch ({t['col']},{t['row']})",
                         base_point(cams, extr, s["neck_deg"], s["left"]["T_cam_board"], t["col"], t["row"]),
-                        np.array(t["tip_in_arm_base_m"])))
+                        so101_kin.tip_position(t["left_arm_deg"])))
     return out
 
 

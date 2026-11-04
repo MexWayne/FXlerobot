@@ -35,6 +35,9 @@ FRONTIER_CLOSE_M = 0.25  # gaps between far rays this small are closed before lo
 HIT_MIN = 2
 HIT_SHARE = 0.25
 MATCH_TRIM_M = 0.15   # a scan point farther than this from every occupied cell counts this much
+# Lidar returns this close to a thing the cameras named and the body drives over (trash_low: paper,
+# bottles) are that thing: a lying bottle is in the beam. They stay in the lidar map for matching.
+OVER_LIDAR_M = 0.05
 
 
 def erode(free, radius_cells):
@@ -117,7 +120,8 @@ class OccMap:
 
         now = time.monotonic() if now is None else now
         self._lidar = self.lidar_occ()
-        occ = self._lidar | (self.vis_end > now) | self.trash | (self.objects & ~self.stood) | self.glass
+        over = cv2.dilate(self.trash_low.astype(np.uint8), disk(OVER_LIDAR_M / self.res)) > 0
+        occ = (self._lidar & ~over) | (self.vis_end > now) | self.trash | (self.objects & ~self.stood) | self.glass
         self._occ = occ
         free = self.seen & ~occ
         # Unknown cells count as blocked: the body only goes where a ray has been.

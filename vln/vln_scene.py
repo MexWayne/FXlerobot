@@ -81,9 +81,31 @@ FLOOR_SEEN_M = 2.0       # stereo floor points farther than this do not clear ol
 BOUNDARY_KEYS = ("墙", "围栏", "栏杆", "踢脚", "基座")  # the lidar maps these where it sees them
 GLASS_KEYS = ("玻璃", "镜")
 # Small things on the floor the arms pick up. Only once measured no longer than PICK_MAX_M: a big
-# sheet of cardboard called 包装 or 纸屑 is an obstacle.
+# sheet of cardboard called 包装 is an obstacle (paper and bottles are not: ANY_SIZE_KEYS).
 PICK_KEYS = ("垃圾", "纸团", "纸屑", "纸巾", "塑料袋", "包装", "瓶", "罐", "果皮", "烟头", "碎屑", "食物", "小物件")
 PICK_MAX_M = 0.15        # longest side of a thing the grippers take
+# Paper on the floor is driven over, whatever it measures: its height comes from the box top and the
+# stereo floor patch, both a few cm off (scraps came out 0.04-0.06 m), and a scrap placed from looks a
+# few cm apart comes out longer than it is. It stays marked for the arms to pick up.
+DRIVE_OVER_KEYS = ("纸屑", "纸团", "纸巾")
+# Bottles are to be picked up too, whatever they measure (0.15-0.25 m), but driven round: driven over,
+# the body ran into them (user, 2026-11-04).
+ANY_SIZE_KEYS = DRIVE_OVER_KEYS + ("瓶",)
+
+
+BIN_KEYS = ("垃圾桶", "垃圾箱")
+
+
+def is_bin(label):
+    """A trash can, by its name."""
+    return any(k in label for k in BIN_KEYS)
+
+
+def to_pick(label):
+    """A thing the arms pick up, by its name. A trash can holds trash; it is not trash (垃圾)."""
+    return any(k in label for k in PICK_KEYS) and not is_bin(label)
+
+
 # Long thin things on the floor: placed along the line the VLM traces through them, not over their box.
 WIRE_KEYS = ("电线", "数据线", "网线", "充电线", "线缆", "绳")
 # Things that lie flat on the floor: the stereo floor patch in their box is them. In the box of anything
@@ -116,6 +138,16 @@ OVERHEAD_MIN_LIDAR = 3
 # An overhang's lower edge is at least this high (desk edges 0.6-0.75 m, drawers and trays about 0.45 m).
 # Lower comes out a base or kickboard, or a far desk ranged onto something standing in front of it.
 OVERHANG_MIN_Z = 0.30
+# A table seen whole, its feet on the floor in the picture: the box bottom is its feet, so where that
+# line meets the floor is how far it is. Farther than OVERHEAD_FEET_FAR_M it is left until the body is
+# near (its own legs are then in range); nearer, supports more than OVERHEAD_FEET_FRONT_M in front of
+# its feet stand in front of it and are not its legs.
+OVERHEAD_FEET_FAR_M = 2.0
+OVERHEAD_FEET_FRONT_M = 0.5
+# Stereo cells nearer than the nearest lidar support by more than this do not hold the edge: the
+# stereo reaches 1 m only and mismatches on edges against a bright background (2026-11-03: a sleeve
+# in front of a far desk came out 0.88 m away and put the desk's edge there).
+OVERHEAD_STEREO_AHEAD_M = 0.10
 
 # label, points and sure in the base frame (x forward, y left). kind: floor, person, trash (small, to
 # pick up), overhead, glass or near (stereo cells outside every box; sure are the ones seen again from
@@ -149,7 +181,8 @@ OVERHEAD_PROMPT = """你是机器人的避障模块，场景是办公室，图�
 标签写整件家具的名字：“桌子”“柜子”“书架”，不要写桌面、抽屉、隔板这种部件名。
 一直落到地面的柜子、窗台下面的矮墙、踢脚线这里不要框；立在或放在地上的东西（人、椅子、凳子、箱子、包、托盘、垫子、电线、垃圾）这里也不要框，另外检查。
 """ + GLASS_RULE + "\n" + SELF_RULE + """
-只输出 JSON，不要其他文字：{"objects": [{"bbox": [x1, y1, x2, y2], "label": "名字"}, ...]}；没有这些东西输出 {"objects": []}。
+每个框再给 "feet"：这件家具的腿、脚或底座落到地面的地方在画面里能看到（整件家具都在画面里，通常是离得远的），写 true；看不到（桌面从画面上方伸下来、腿被挡住或在画面外），写 false。
+只输出 JSON，不要其他文字：{"objects": [{"bbox": [x1, y1, x2, y2], "label": "名字", "feet": false}, ...]}；没有这些东西输出 {"objects": []}。
 坐标用 0-1000 归一化，图像左上角为 (0,0)，右下角为 (1000,1000)。"""
 
 
@@ -226,7 +259,8 @@ def parse_reply(reply):
 
 
 def _objects(ans):
-    """(label, [x1, y1, x2, y2] in pixels, traced line in pixels or None) of every box in a reply."""
+    """(label, [x1, y1, x2, y2] in pixels, traced line in pixels or None, feet on the floor in view) of
+    every box in a reply."""
     objs = (ans or {}).get("objects")
     if objs is None and (ans or {}).get("bbox"):  # older single-box answer
         objs = [ans]
@@ -242,7 +276,8 @@ def _objects(ans):
         line = None
         if isinstance(obj.get("line"), list):
             line = [(_px(p[0], cal.WIDTH), _px(p[1], cal.HEIGHT)) for p in (_numbers(q, 2) for q in obj["line"]) if p]
-        out.append((object_name(str(obj.get("label") or "障碍")), (x1, y1, x2, y2), line if line and len(line) >= 2 else None))
+        out.append((object_name(str(obj.get("label") or "障碍")), (x1, y1, x2, y2), line if line and len(line) >= 2 else None,
+                    obj.get("feet") is True))
     return out
 
 
@@ -300,7 +335,9 @@ def _prune_runs(root, keep):
     """Delete all but the newest `keep` image folders of past runs; the Jetson disk is small."""
     import shutil
 
-    runs = sorted(d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d)))
+    # Only run folders (time stamps) count: other folders sorted after them, and the run just begun
+    # was deleted with the older ones (2026-11-04).
+    runs = sorted(d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d)) and re.fullmatch(r"\d{8}_\d{6}", d))
     for name in runs[:-keep]:
         shutil.rmtree(os.path.join(root, name), ignore_errors=True)
 
@@ -445,7 +482,7 @@ class Head:
             print(f"  [{name}] 车身占画面 {share:.0%}", flush=True)
         return bool(self.self_mask)
 
-    def lane(self, d_yaw=0.0, near_only=False, where=None):
+    def lane(self, d_yaw=0.0, near_only=False, where=None, pitches=None):
         """Everything one stop sees ahead, as a list of Hit in the base frame.
 
         The head looks up first (UP_PITCH: tabletops and shelves), then down (LANE_PITCHES, far to
@@ -458,7 +495,8 @@ class Head:
         self.glass_spans = []
         self.up_view = None
         hits, floor = [], []
-        for pitch in (UP_PITCH,) + ((LANE_PITCHES[-1],) if near_only else LANE_PITCHES):
+        # pitches: only these head pitches (e.g. a quick look at the floor for things to pick up).
+        for pitch in pitches or ((UP_PITCH,) + ((LANE_PITCHES[-1],) if near_only else LANE_PITCHES)):
             got, flat = self._lane_at(d_yaw, pitch)
             hits += got
             floor += flat
@@ -486,7 +524,7 @@ class Head:
         self_top = min(0.9, SELF_TOP - 0.01 * (pitch - NEAR_PITCH))
         hits, boxes, marks = [], [], []
         shown = np.zeros(pts.shape[:2], bool)
-        for label, box, line in _objects(ans):
+        for label, box, line, feet in _objects(ans):
             x1, y1, x2, y2 = box
             if mask is not None:
                 on_self = float(mask[int(y1):int(y2) + 1, int(x1):int(x2) + 1].mean())
@@ -509,7 +547,7 @@ class Head:
                   and self._lidar_in(self._rays(cam, x1, x2, min(y2, cal.HEIGHT - 1)), LIDAR_PAD_DEG)):
                 continue  # the lidar sees this wall or fence and maps it
             elif up:
-                hit, kept = self._overhead(label, box, cam, pts, mask, tag)
+                hit, kept = self._overhead(label, box, cam, pts, mask, tag, feet)
             else:
                 hit, kept = self._locate(label, box, cam, pts, mask, tag, line)
             shown |= kept
@@ -743,9 +781,9 @@ class Head:
         print(f"  [{tag}] 看到{label}，{how}量到最近 {near:.2f} m（{len(cells)} 点），"
               f"高{'至少' if top_cut else '约'} {height:.2f} m", flush=True)
         kind = "person" if "人" in label else "floor"
-        if kind == "floor" and any(k in label for k in PICK_KEYS):
+        if kind == "floor" and to_pick(label):
             length = floor_size(cells)[0] + (STEREO_CELL_M if how.startswith("双目") else 0.0)
-            if length <= PICK_MAX_M:
+            if length <= PICK_MAX_M or any(k in label for k in ANY_SIZE_KEYS):
                 kind = "trash"
             else:
                 print(f"  [{tag}] {label}量到长 {length:.2f} m，比夹爪能夹的 {PICK_MAX_M:.2f} m 大，当障碍",
@@ -830,7 +868,7 @@ class Head:
               "雷达在它后面的回波不用", flush=True)
         return Hit(label, line, line, "glass", "双目"), sel
 
-    def _overhead(self, label, box, cam, pts, mask, tag):
+    def _overhead(self, label, box, cam, pts, mask, tag, feet=False):
         """A tabletop, drawer or shelf boxed in an upward look, as a hit along its lower edge.
 
         The rays through the box bottom give the bearings of the edge and how steeply it is seen,
@@ -852,13 +890,24 @@ class Head:
             return None, np.zeros(self.stereo.uv.shape[:2], bool)
         z_cam = float(cam["T_base_cam"][2, 3])
         rays = self._rays(cam, x1, x2, min(y2, cal.HEIGHT - 1))
+        # The VLM sees the thing whole, feet on the floor: its box bottom is its feet, and where that
+        # line meets the floor is its range, not the nearest thing in its bearings.
+        nearest_ok = 0.28
+        down = [z_cam / -rise for _, rise in rays if rise < 0]
+        if feet and down:
+            at = float(np.median(down))
+            if at > OVERHEAD_FEET_FAR_M:
+                print(f"  [{tag}] {label}整件都在画面里，脚落在约 {at:.1f} m 外的地上：是远处的家具，"
+                      "走近了再量，这次不标", flush=True)
+                return None, np.zeros(self.stereo.uv.shape[:2], bool)
+            nearest_ok = max(nearest_ok, at - OVERHEAD_FEET_FRONT_M)
         cells, kept = self._footprint(pts, (x1, y1, x2, cal.HEIGHT - 1), mask, reach=STEREO_TRUST_M)
         pad = math.radians(OVERHEAD_PAD_DEG)
         lo, hi = min(b for b, _ in rays) - pad, max(b for b, _ in rays) + pad
         support = [(math.atan2(py, px), math.hypot(px, py), px, py, False) for px, py in cells
-                   if lo <= math.atan2(py, px) <= hi and math.hypot(px, py) >= 0.28]
+                   if lo <= math.atan2(py, px) <= hi and math.hypot(px, py) >= nearest_ok]
         support += [(math.atan2(py, px), math.hypot(px, py), px, py, True)
-                    for px, py in self._lidar_in(rays, OVERHEAD_PAD_DEG)]
+                    for px, py in self._lidar_in(rays, OVERHEAD_PAD_DEG) if math.hypot(px, py) >= nearest_ok]
         # The wheels of a chair already known there are that chair's, not legs of a desk seen beyond it.
         if support and self.taken is not None and self.where is not None:
             x0, y0, yaw = self.where
@@ -878,8 +927,10 @@ class Head:
             print(f"  [{tag}] 看到{label}，但下面雷达只扫到 {n_lidar} 个点（桌腿至少要 {OVERHEAD_MIN_LIDAR} 个），"
                   "可能是远处的或别的东西，不当成伸在上方的东西", flush=True)
             return None, kept
-        near = min(s[1] for s in support)
-        support = [s for s in support if s[1] <= near + OVERHEAD_DEPTH_M]
+        # The range of the edge is the nearest lidar support. Stereo cells only add to it where they
+        # agree; one well in front of every lidar return is a mismatch, not a leg.
+        near = min(s[1] for s in support if s[4])
+        support = [s for s in support if near - (0.0 if s[4] else OVERHEAD_STEREO_AHEAD_M) <= s[1] <= near + OVERHEAD_DEPTH_M]
         # Wide boxes space the samples further apart than OVERHEAD_RAY_DEG; every support still
         # reaches the sample nearest to it.
         win = max(math.radians(OVERHEAD_RAY_DEG), (hi - lo - 2 * pad) / 12.0 + math.radians(0.5), pad)
@@ -948,6 +999,14 @@ class Head:
             print(f"  [{tag}] {label}的下沿有 {low} 处贴着地面，那几处不算", flush=True)
         points = sorted(_densify(edge, 0.04) + [(s[2], s[3]) for s in support], key=lambda p: math.hypot(*p))
         n_lidar = sum(1 for s in support if s[4])
+        # The check above counted every return in the box's bearings. What holds up the edge that is
+        # kept must be legs the lidar sees too: held by a few stereo cells only, it is the edge of a
+        # desk far behind, ranged onto something nearer in its bearings (2026-11-03: a backpack put a
+        # far desk's edge 0.85 m ahead and shut the way, 0 lidar returns under it).
+        if n_lidar < OVERHEAD_MIN_LIDAR:
+            print(f"  [{tag}] 看到{label}，但量出来的前沿下面雷达只有 {n_lidar} 个点（桌腿至少要 {OVERHEAD_MIN_LIDAR} 个），"
+                  "是远处的桌子借了近处东西的距离，不用", flush=True)
+            return None, kept
         height = float(np.median([z for _, _, _, z in used]))
         print(f"  [{tag}] 看到{label}伸在前方：下面雷达 {n_lidar} 个点、双目 {len(support) - n_lidar} 格，"
               f"前沿最近 {min(r for _, _, r, _ in used):.2f} m，下沿离地约 {height:.2f} m", flush=True)

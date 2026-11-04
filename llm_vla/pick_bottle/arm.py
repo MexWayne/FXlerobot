@@ -29,7 +29,19 @@ LIMIT_MARGIN_DEG = 3.0  # stay this far inside the calibrated range
 # then told to squeeze only this far past where it stopped.
 STALL_LAG_TICKS = 50
 STALL_CYCLES = 8
-SQUEEZE_TICKS = 25
+SQUEEZE_TICKS = 100  # ~9 deg: the servo pushes with what its torque limit allows (25 held bottles loosely)
+# LeRobot leaves the gripper at 50 % torque, current protection 250 and Overload_Torque 25 (so_follower.py):
+# a cap held for Protection_Time (2 s) counts as an overload and the jaw drops to 20 % torque, and the
+# bottle slips out on the way (2026-11-04). On first torque-on the gripper gets the other joints'
+# protection instead. These are EEPROM values: they stay until LeRobot configures the arm again.
+GRIP_EEPROM = {"Max_Torque_Limit": (16, 2, 1000), "Protection_Current": (28, 2, 500), "Overload_Torque": (36, 1, 80)}
+GRIP_TORQUE_LIMIT = (48, 1000)  # RAM Torque_Limit, loaded from Max_Torque_Limit only at power-up
+# Squeezed SQUEEZE_TICKS past the cap the jaw draws ~325 mA (36 % load) for as long as it holds: carried
+# 13 min to the can it reached its 70 C limit, unloaded and did not open over the can (2026-11-04).
+# Carrying it is eased to HOLD_TICKS past where it stopped: ~70 mA, 16 % load. Held at 60 ticks (~130 mA)
+# it still warmed 55 -> 60 C in 12 min; at 30 it cooled 60 -> 54 C in 7 min, and the cap stayed put.
+HOLD_TICKS = 40
+TEMP_ADDR, STATUS_ADDR = 63, 65  # Present_Temperature (C), Status (bit 2: too hot, torque unloaded)
 
 
 def joint_limits(cal=None):
@@ -68,9 +80,43 @@ class LeftArm:
     def deg(self):
         return {n: degrees(t, self.cal[n]) for n, t in self.ticks().items()}
 
+    def _raw(self, sid, addr, n, value=None):
+        """Read (value None) or write a register by address."""
+        pk, port = self.bus.pk, self.bus.port
+        if value is None:
+            v, comm, _ = (pk.read1ByteTxRx if n == 1 else pk.read2ByteTxRx)(port, sid, addr)
+            return v if comm == 0 else None
+        comm, _ = (pk.write1ByteTxRx if n == 1 else pk.write2ByteTxRx)(port, sid, addr, int(value))
+        return comm == 0
+
+    def strong_gripper(self):
+        """The gripper's EEPROM protection to GRIP_EEPROM where it differs (torque off meanwhile, as
+        LeRobot does), its torque limit to GRIP_TORQUE_LIMIT. Returns the names changed."""
+        sid = self.ids["gripper"]
+        todo = {k: v for k, v in GRIP_EEPROM.items() if self._raw(sid, v[0], v[1]) != v[2]}
+        if todo:
+            self.bus.write(sid, "Torque_Enable", 0)
+            self.bus.write(sid, "Lock", 0)
+            try:
+                for name, (addr, n, value) in todo.items():
+                    # The status reply of an EEPROM write gets lost now and then: read it back instead.
+                    for _ in range(3):
+                        self._raw(sid, addr, n, value)
+                        time.sleep(0.02)
+                        if self._raw(sid, addr, n) == value:
+                            break
+                    else:
+                        raise RuntimeError(f"左臂夹爪写 {name} 失败")
+            finally:
+                self.bus.write(sid, "Lock", 1)
+        return list(todo)
+
     def enable(self):
         if self.torque:
             return
+        changed = self.strong_gripper()
+        if changed:
+            print(f"  夹爪力矩保护改成和其他关节一样：{', '.join(changed)}", flush=True)
         present = self.ticks()
         for name, sid in self.ids.items():
             if self.bus.read(sid, "Operating_Mode") != POSITION_MODE:
@@ -81,6 +127,7 @@ class LeftArm:
             self.bus.write(sid, "Acceleration", 40)
             if not self.bus.write(sid, "Torque_Enable", 1):
                 raise RuntimeError(f"左臂 {name} 打不开力矩")
+        self._raw(self.ids["gripper"], GRIP_TORQUE_LIMIT[0], 2, GRIP_TORQUE_LIMIT[1])
         self.torque = True
 
     def hold(self):
@@ -154,6 +201,20 @@ class LeftArm:
             raise
         time.sleep(0.3)
         return self.deg()["gripper"]
+
+    def ease_grip(self, closed_deg):
+        """Holding something: squeeze only HOLD_TICKS past where the jaw stands (towards closed_deg)
+        instead of SQUEEZE_TICKS, so the gripper does not overheat on a long carry."""
+        sid = self.ids["gripper"]
+        present = self.bus.read(sid, "Present_Position")
+        sign = 1 if self.to_ticks("gripper", closed_deg) > present else -1
+        self.bus.write(sid, "Goal_Position", present + sign * HOLD_TICKS)
+
+    def gripper_heat(self):
+        """(temperature C, overheated) of the gripper servo."""
+        sid = self.ids["gripper"]
+        status = self._raw(sid, STATUS_ADDR, 1) or 0
+        return self._raw(sid, TEMP_ADDR, 1), bool(status & 4)
 
     def relax(self):
         for sid in self.ids.values():

@@ -137,7 +137,8 @@ def move(arm, q, speed, label):
     now = arm.deg()
     full = {**now, **q}
     z = [tip_base({k: now[k] + (full[k] - now[k]) * s for k in now})[2] for s in np.linspace(0, 1, 21)]
-    if min(z) < min(z[0], z[-1]) - PATH_CLEAR_M or min(z) < MIN_TIP_Z_M:
+    # A tip that starts lower than MIN_TIP_Z_M (the arm sags at a low cap) may still move up out of it.
+    if min(z) < min(z[0], z[-1]) - PATH_CLEAR_M or min(z) < min(MIN_TIP_Z_M, z[0] - 0.001):
         raise SystemExit(f"{label}：路上爪尖会低到 {min(z) * 1000:.0f} mm，不动")
     t0 = time.monotonic()
     got = arm.move(q, speed)

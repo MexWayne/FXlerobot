@@ -14,6 +14,12 @@ import numpy as np
 import serial
 
 BAUD = 460800
+# Closing: stop commands every STOP_EVERY_S until nothing has arrived for QUIET_S, at most STOP_MAX_S.
+STOP_EVERY_S = 0.5
+QUIET_S = 0.3
+STOP_MAX_S = 4.0
+SPIN_UP_S = 3.0      # the motor must be spinning before scan points come out
+DESCRIPTOR = b"\xa5\x5a"
 # C1: ignore the robot body inside 0.25 m. White targets are valid out to 12 m.
 RMIN, RMAX = 0.25, 12.0
 # The body blocks the lidar behind: back there it only returns the robot itself (a steady 0.26 m
@@ -63,7 +69,7 @@ class Lidar:
     def close(self):
         self._stop = True
         if self._thread is not None:
-            self._thread.join(5.0)  # the reader drains the stream before it closes the port
+            self._thread.join(STOP_MAX_S + 4.0)  # the reader drains the stream before it closes the port
 
     def scans(self, n=2, timeout=2.0):
         """The next n full turns (each N x 2, base frame), for a robot standing still. [] on timeout."""
@@ -87,20 +93,32 @@ class Lidar:
 
     def _run(self):
         try:
-            link = serial.Serial(self.port, BAUD, timeout=1)
+            # A write that cannot go out (the CP2102 hung) must not block the reader for good.
+            link = serial.Serial(self.port, BAUD, timeout=1, write_timeout=1.0)
         except serial.SerialException as err:
             self._error = str(err)
             return
         try:
             link.dtr = link.rts = False
             link.write(b"\xa5\x25")
-            time.sleep(3.0)  # the motor must be spinning before scan points come out
-            link.reset_input_buffer()
+            # While the motor spins up, whatever the lidar still sends is read out, not purged: a
+            # purge (request 0x12) with data piling up unread times out and hangs the CP2102
+            # (2026-11-03, after a 3 s sleep here).
+            link.timeout = 0.05
+            t_end = time.time() + SPIN_UP_S
+            while time.time() < t_end:
+                link.read(4096)
+            link.timeout = 1
             link.write(b"\xa5\x20")
-            if link.read(7)[:2] != b"\xa5\x5a":
+            # The scan descriptor (7 bytes) starts with A5 5A; anything still in front of it is skipped.
+            buf, t_end = b"", time.time() + 2.0
+            while DESCRIPTOR not in buf and time.time() < t_end:
+                buf += link.read(64)
+            if DESCRIPTOR not in buf:
                 self._error = "雷达没有返回扫描描述符"
                 return
-            cur, buf, prev = [], b"", None
+            buf = buf[buf.index(DESCRIPTOR) + 7:]
+            cur, prev = [], None
             while not self._stop:
                 buf += link.read(max(5, min(link.in_waiting, 4096)))
                 while len(buf) >= 5:
@@ -121,15 +139,26 @@ class Lidar:
             # Stop the scan and read out what is still arriving before closing. Closed while the
             # lidar still streams at 460800 baud, the CP2102's purge and disable requests time out
             # (dmesg: "failed set request 0x12 status: -110") and the next open fails with an I/O
-            # error until the USB cable is replugged.
+            # error until the USB cable is replugged. Reading for a fixed 2 s and then purging did
+            # that too (2026-11-03): the stream had not ended. So the stop is sent again until the
+            # line has been quiet for QUIET_S, and there is no purge (request 0x12) at all.
             try:
-                link.write(b"\xa5\x25")
                 link.timeout = 0.05
-                quiet = time.time() + 2.0
-                while time.time() < quiet and link.read(4096):
-                    pass
-                time.sleep(0.05)
-                link.reset_input_buffer()
+                t0 = time.time()
+                sent = quiet_since = None
+                while time.time() - t0 < STOP_MAX_S:
+                    now = time.time()
+                    if sent is None or now - sent >= STOP_EVERY_S:
+                        link.write(b"\xa5\x25")
+                        sent = now
+                    if link.read(4096):
+                        quiet_since = None
+                    elif quiet_since is None:
+                        quiet_since = now
+                    elif now - quiet_since >= QUIET_S:
+                        break
+                else:
+                    print("  雷达停不下来：关串口后可能要拔插雷达 USB", flush=True)
             except serial.SerialException:
                 pass
             link.close()
