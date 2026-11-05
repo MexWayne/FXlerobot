@@ -34,7 +34,7 @@ import numpy as np  # noqa: E402
 from coverage_plan import ban_goal, explore_goal, route_to  # noqa: E402
 from live_map import MapView  # noqa: E402
 from occmap import BODY_CLEARANCE_M, BODY_LENGTH_M, BODY_WIDTH_M, OccMap, disk  # noqa: E402
-from vln_scene import ANY_SIZE_KEYS, DRIVE_OVER_KEYS, PICK_MAX_M, is_bin, to_pick  # noqa: E402
+from vln_scene import ANY_SIZE_KEYS, DRIVE_OVER_KEYS, DRIVE_ROUND_KEYS, PICK_MAX_M, is_bin, to_pick  # noqa: E402
 
 MAP_DIR = os.path.join(HERE, "map")
 
@@ -71,6 +71,7 @@ MATCH_YAW_DEG = 3.0
 MATCH_OK_M = 0.04     # mean distance of scan points to the map of a fit that is trusted
 LOOK_M = 0.35         # stop and look after this much straight driving
 LOOK_FRESH_S = 3.0    # a look older than this cannot veto a turn
+LOOK_REUSE_S = 30.0   # follow: a look this recent, from the same place, is not taken again
 STOP_MARGIN = 0.08    # keep this much floor between the body and anything seen ahead
 TURN_SPARE = 0.05     # anything inside the turning circle plus this stops a turn
 TURN_LOOK_DEG = 30.0  # turn in steps the head (NECK_SIDE_MAX plus half the camera view) can look ahead of
@@ -133,8 +134,10 @@ LOG_KEEP = 5
 
 
 def passable(label, height):
-    """A thing to pick up the body drives over: paper (vln_scene.DRIVE_OVER_KEYS), or anything flat
-    enough. Bottles are driven round."""
+    """A thing to pick up the body drives over: flat paper (vln_scene.DRIVE_OVER_KEYS), or anything
+    flat enough, but never bottles or paper balls (DRIVE_ROUND_KEYS), however low they measure."""
+    if any(k in label for k in DRIVE_ROUND_KEYS):
+        return False
     return any(k in label for k in DRIVE_OVER_KEYS) or (height is not None and height <= PASS_OVER_M)
 
 
@@ -1006,7 +1009,20 @@ def follow(mover, head, route, status):
                     else:
                         return "turn"
             mover.hold = heading if rel == 0.0 else mover.yaw
-            hits = look(mover, head, d_yaw=_neck(-math.degrees(rel)))
+            # mover.follow_near_only (set by a caller on a known map): only the near floor look,
+            # not three, per step; demo/bottle_to_bin crept 1 m in 20 min with three (2026-11-05).
+            # Not moved since the last look (same place, same head yaw, LOOK_REUSE_S ago at most):
+            # that look again. Hemmed in where it could not turn, it looked up and down at the same
+            # bottle, strip and wire for every next spot it tried (2026-11-05).
+            d_yaw = _neck(-math.degrees(rel))
+            last = getattr(mover, "last_hits", None)
+            if (last is not None and last[0] == d_yaw and time.monotonic() - last[2] < LOOK_REUSE_S
+                    and math.hypot(mover.x - last[1][0], mover.y - last[1][1]) < 0.03
+                    and abs(wrap_deg(math.degrees(mover.yaw - last[1][2]))) < 3.0):
+                hits = last[3]
+            else:
+                hits = look(mover, head, d_yaw=d_yaw, near_only=getattr(mover, "follow_near_only", False))
+                mover.last_hits = (d_yaw, mover.pose, time.monotonic(), hits)
             free = free_ahead(mover, hits, rel)
             step = min(LOOK_M, d, free)
             if step < 0.03:

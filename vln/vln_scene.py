@@ -82,15 +82,17 @@ BOUNDARY_KEYS = ("墙", "围栏", "栏杆", "踢脚", "基座")  # the lidar map
 GLASS_KEYS = ("玻璃", "镜")
 # Small things on the floor the arms pick up. Only once measured no longer than PICK_MAX_M: a big
 # sheet of cardboard called 包装 is an obstacle (paper and bottles are not: ANY_SIZE_KEYS).
-PICK_KEYS = ("垃圾", "纸团", "纸屑", "纸巾", "塑料袋", "包装", "瓶", "罐", "果皮", "烟头", "碎屑", "食物", "小物件")
+PICK_KEYS = ("垃圾", "纸团", "纸屑", "纸片", "纸巾", "塑料袋", "塑料片", "包装", "瓶", "罐", "果皮", "烟头",
+             "碎屑", "碎片", "食物", "小物件")
 PICK_MAX_M = 0.15        # longest side of a thing the grippers take
-# Paper on the floor is driven over, whatever it measures: its height comes from the box top and the
-# stereo floor patch, both a few cm off (scraps came out 0.04-0.06 m), and a scrap placed from looks a
-# few cm apart comes out longer than it is. It stays marked for the arms to pick up.
-DRIVE_OVER_KEYS = ("纸屑", "纸团", "纸巾")
-# Bottles are to be picked up too, whatever they measure (0.15-0.25 m), but driven round: driven over,
-# the body ran into them (user, 2026-11-04).
-ANY_SIZE_KEYS = DRIVE_OVER_KEYS + ("瓶",)
+# Flat paper on the floor is driven over, whatever it measures: its height comes from the box top and
+# the stereo floor patch, both a few cm off (scraps came out 0.04-0.06 m), and a scrap placed from looks
+# a few cm apart comes out longer than it is. It stays marked for the arms to pick up.
+DRIVE_OVER_KEYS = ("纸屑", "纸片", "纸巾")
+# Bottles and paper balls are to be picked up too, whatever they measure, but driven round, however low
+# they measure: driven over, the body ran into bottles; paper balls are driven round too (user, 2026-11-04).
+DRIVE_ROUND_KEYS = ("瓶", "纸团")
+ANY_SIZE_KEYS = DRIVE_OVER_KEYS + DRIVE_ROUND_KEYS
 
 
 BIN_KEYS = ("垃圾桶", "垃圾箱")
