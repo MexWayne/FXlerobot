@@ -5,7 +5,9 @@ jaws still close horizontally (the bottle swings about the closing line). The to
 cost keeps it near pointing down, which keeps the wrist above the bottle. The arm goes from PARK up
 and out over the can in short steps, the height ahead of the way out (straight above PARK the arm
 does not reach as high as further out), each IK started from the step before so the wrist never
-turns over on the way. Over the can the bottle stays above the rim all the way.
+turns over on the way. Over the can the bottle stays above the rim all the way, then, the grasp
+point over the can's centre, goes straight down until the jaws are about level with the rim
+(GRIP_AT_RIM_M, the user, 2026-11-07: not let go high over the can) and is let go there.
 """
 
 import sys
@@ -22,7 +24,11 @@ import pick  # noqa: E402
 from arm import joint_limits  # noqa: E402
 
 BOTTLE_HANG_M = 0.21   # held by the cap, a bottle of unknown length reaches this far below the grasp point
-DROP_CLEAR_M = 0.04    # bottle bottom this far above the rim when it is let go
+DROP_CLEAR_M = 0.04    # bottle bottom this far above the rim when it comes over the can
+# Then straight down until the grasp point is this high over the rim (about level with it), and let
+# go there: let go above the rim, a bottle 4-5 cm short of the can's centre hit the rim and bounced
+# out (2026-11-06).
+GRIP_AT_RIM_M = 0.0
 STEP_M = 0.03          # waypoints this far apart: one big step turns the wrist over
 RISE_LEAD = 2.0        # on the way out the height is reached this many times sooner than the place
 BOTTLE_R_M = 0.04      # the hanging bottle's half width, against the rim
@@ -37,6 +43,7 @@ LET_GO_S = 1.0
 # Let go, the jaw must come this close to OPEN_DEG: an overheated gripper unloads and stays shut on
 # the cap, and the bottle went back out still held (2026-11-04).
 OPENED_TOL_DEG = 15.0
+DOWN_LABEL = "放进桶里"  # plan_drop's labels of the steps straight down over the can
 
 
 def _tilt(tool):
@@ -76,9 +83,9 @@ def solve_point(goal, seed, limits, offset, iters=150):
 
 
 def plan_drop(arm_now, bin_xy, bin_r, rim_z, hang=BOTTLE_HANG_M):
-    """Joint waypoints from the arm as it is (PARK, holding a bottle) out over the can (base frame
-    x, y of its centre, its radius and rim height); the bottle reaches `hang` below the grasp point.
-    Raises SystemExit when the can is out of reach or too tall."""
+    """[(label, joints)] from the arm as it is (PARK, holding a bottle) out over the can (base frame
+    x, y of its centre, its radius and rim height) and down into it; the bottle reaches `hang` below
+    the grasp point. Raises SystemExit when the can is out of reach or too tall."""
     T = mount.load()
     R, t = T[:3, :3], T[:3, 3]
     offset = ik.tcp_offset(pick.CAP_RADIUS_M)
@@ -97,8 +104,14 @@ def plan_drop(arm_now, bin_xy, bin_r, rim_z, hang=BOTTLE_HANG_M):
             goals.append(cur.copy())
         cur = np.r_[xy, max(cur[2], need, start[2] + (z - start[2]) * min(1.0, RISE_LEAD * k / n))]
         goals.append(cur.copy())
+    labels = [f"举到垃圾桶上方 {k + 1}/{len(goals)}" for k in range(len(goals))]
+    low = rim_z + GRIP_AT_RIM_M
+    while cur[2] > low + 1e-6:
+        cur = np.r_[cur[:2], max(low, cur[2] - STEP_M)]
+        goals.append(cur.copy())
+        labels.append(f"{DOWN_LABEL}：抓取点在桶口上方 {(cur[2] - rim_z) * 100:.0f} cm")
     q, path = dict(arm_now), []
-    for g in goals:
+    for label, g in zip(labels, goals):
         nxt, ok = solve_point(R.T @ (g - t), q, limits, offset)
         if not ok:
             raise SystemExit(f"够不着垃圾桶上方 ({g[0]:.2f}, {g[1]:.2f}, {g[2]:.2f}) m：桶口离地 {rim_z:.2f} m，"
@@ -106,15 +119,21 @@ def plan_drop(arm_now, bin_xy, bin_r, rim_z, hang=BOTTLE_HANG_M):
         if max(abs(nxt[j] - q[j]) for j in ik.JOINTS) > MAX_STEP_DEG:
             raise SystemExit("往垃圾桶上方去的路上手腕要翻转，不动")
         q = nxt
-        path.append(q)
+        path.append((label, q))
     return path
 
 
-def drop(arm, bin_xy, bin_r, rim_z, hang=BOTTLE_HANG_M):
-    """Out over the can, open, back the same way, PARK (holding nothing)."""
+def drop(arm, bin_xy, bin_r, rim_z, hang=BOTTLE_HANG_M, speed=None):
+    """Out over the can (at CARRY_DEG_S, a bottle hanging, or `speed`), down until the jaws are about
+    level with the rim, open, back the same way, PARK (holding nothing)."""
     path = plan_drop(arm.deg(), bin_xy, bin_r, rim_z, hang)
-    for k, q in enumerate(path):
-        pick.move(arm, q, pick.CARRY_DEG_S, f"举到垃圾桶上方 {k + 1}/{len(path)}")
+    # Out over the can in one sweep, then down in one, each through its waypoints without stopping
+    # (pick.move_path); the stop over the can lets a hanging bottle settle before it goes down.
+    out = [q for label, q in path if not label.startswith(DOWN_LABEL)]
+    down = [q for label, q in path if label.startswith(DOWN_LABEL)]
+    pick.move_path(arm, out, speed or pick.CARRY_DEG_S, "举到垃圾桶上方")
+    if down:
+        pick.move_path(arm, down, speed or pick.CARRY_DEG_S, "放进桶里：抓取点降到桶口")
     got = pick.move(arm, {"gripper": pick.OPEN_DEG}, pick.FREE_DEG_S, "松开")
     if got["gripper"] < pick.OPEN_DEG - OPENED_TOL_DEG:
         arm.hold()  # not pressing on the cap any more
@@ -122,6 +141,7 @@ def drop(arm, bin_xy, bin_r, rim_z, hang=BOTTLE_HANG_M):
         raise SystemExit(f"夹爪没张开（停在 {got['gripper']:.0f}°，{temp}°C{'，过热卸力了' if hot else ''}），"
                          "瓶子还在手里，左臂停在垃圾桶上方")
     time.sleep(LET_GO_S)
-    for q in reversed(path[:-1]):
-        pick.move(arm, q, pick.FREE_DEG_S, "收回")
+    back = [q for _, q in reversed(path[:-1])]
+    if back:
+        pick.move_path(arm, back, pick.FREE_DEG_S, "收回")
     pick.park(arm)

@@ -20,7 +20,7 @@ import numpy as np
 
 import coverage_run as cr
 from live_map import _plain
-from occmap import BLOCKED, BODY_DONE, HIT_MIN, TRASH, UNKNOWN, OccMap
+from occmap import BLOCKED, BODY_DONE, HIT_MIN, TRASH, UNKNOWN
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SAVED_DIR = os.path.join(HERE, "map", "saved")
@@ -35,7 +35,12 @@ RELOC_STEP_DEG = 3.0
 RELOC_KEEP = 12           # best search fits refined
 RELOC_APART_M = 0.30      # fits this far apart (or RELOC_APART_DEG turned) are different places
 RELOC_APART_DEG = 15.0
-RELOC_MARGIN_M = 0.005    # the best fit beats every other place by at least this much
+# A place is taken by the share of the turn's points lying on the lidar map (within RELOC_INLIER_M),
+# not by their mean distance: things moved since (bottles, chairs, boxes, the bottle in the jaws)
+# pulled the mean of the right place to 4.1-4.6 cm, over the 4 cm it had to beat (2026-11-06).
+RELOC_INLIER_M = 0.05
+RELOC_MIN_SHARE = 0.5     # at least this share of the points on the map ...
+RELOC_SHARE_MARGIN = 0.10  # ... and this much more than at any other place
 
 
 def save(cmap, mover, folder=SAVED_DIR):
@@ -51,13 +56,6 @@ def save(cmap, mover, folder=SAVED_DIR):
     with open(os.path.join(folder, "things.json"), "w") as f:
         json.dump(things, f, ensure_ascii=False)
     return folder
-
-
-def _cmap_like(origin, res, shape):
-    size = shape[0] * res
-    cmap = OccMap(size_m=size, res=res, center=(origin[0] + size / 2, origin[1] + size / 2))
-    assert (cmap.h, cmap.w) == shape, "saved map has another size"
-    return cmap
 
 
 def _things(mover, cmap, objects, glass, next_id):
@@ -187,37 +185,79 @@ def _search(cmap, xy):
     return best[:RELOC_KEEP * 4]
 
 
-def relocate(mover, status="在已有地图上定位：原地转一圈"):
-    """Find the body on the map it was given (load or from_live) by one turn in place. Sets its pose."""
-    m, cmap = mover, mover.cmap
-    m.x = m.y = OFF_MAP  # nothing is stamped while it turns
-    xy, turned = _round_scan(m, status)
+def _share(cmap, xy, pose):
+    """Share of scan points xy (start frame) within RELOC_INLIER_M of a lidar-occupied cell, the body at `pose`."""
+    c, s = math.cos(pose[2]), math.sin(pose[2])
+    px = pose[0] + c * xy[:, 0] - s * xy[:, 1]
+    py = pose[1] + s * xy[:, 0] + c * xy[:, 1]
+    col = np.floor((px - cmap.origin[0]) / cmap.res).astype(np.int64)
+    row = np.floor((py - cmap.origin[1]) / cmap.res).astype(np.int64)
+    ok = (col >= 0) & (row >= 0) & (col < cmap.w) & (row < cmap.h)
+    near = np.zeros(len(xy), bool)
+    near[ok] = cmap.field()[row[ok], col[ok]] <= RELOC_INLIER_M
+    return float(near.mean())
+
+
+def _best_place(cmap, xy):
+    """(share, fit, pose, second share or None) of the best place on the whole map for scan points xy
+    (start frame), or None when none fits."""
     cells = np.unique(np.floor(xy / cmap.res).astype(np.int64), axis=0, return_index=True)[1]
     xy = xy[cells]
     if len(xy) > RELOC_POINTS:
         xy = xy[np.random.default_rng(0).choice(len(xy), RELOC_POINTS, replace=False)]
-    fits = []
+    fits = []  # (share on the map, mean fit, pose)
     for cost, x, y, a in _search(cmap, xy):
         got = cmap.match(xy, (x, y, a), 0.15, 6.0)
         if got is not None:
-            fits.append((got[1], got[0]))
+            fits.append((_share(cmap, xy, got[0]), got[1], got[0]))
     if not fits:
-        raise SystemExit("在地图上找不到雷达这一圈对得上的地方")
-    fits.sort(key=lambda f: f[0])
-    fit, (x, y, a) = fits[0]
-    others = [f for f, p in fits[1:] if math.hypot(p[0] - x, p[1] - y) > RELOC_APART_M
+        return None
+    fits.sort(key=lambda f: -f[0])
+    share, fit, (x, y, a) = fits[0]
+    others = [f for f, _, p in fits[1:] if math.hypot(p[0] - x, p[1] - y) > RELOC_APART_M
               or abs(cr.wrap_deg(math.degrees(p[2] - a))) > RELOC_APART_DEG]
-    second = min(others) if others else None
+    return share, fit, (x, y, a), (max(others) if others else None)
+
+
+def locate_anywhere(mover, xy):
+    """The body's pose found again on the whole map from the lidar points of one stop (base frame),
+    as relocate() does with a turn: the place where the largest share lies on the map, clearly ahead
+    of any other. None when there is no such place."""
+    got = _best_place(mover.cmap, np.asarray(xy, np.float64).reshape(-1, 2))
+    if got is None:
+        print("  全图找位置：雷达这一圈哪里都对不上", flush=True)
+        return None
+    share, fit, (x, y, a), second = got
+    print(f"  全图找位置：对得最好的是 ({x:+.2f}, {y:+.2f})，朝向 {math.degrees(a):+.0f}°，{share:.0%} 的点在地图上"
+          f"（平均差 {fit * 100:.1f} cm）" + (f"；别处最好 {second:.0%}" if second is not None else "")
+          + f"，推算的位置是 ({mover.x:+.2f}, {mover.y:+.2f})", flush=True)
+    if share < RELOC_MIN_SHARE or (second is not None and share - second < RELOC_SHARE_MARGIN):
+        return None
+    return x, y, a
+
+
+def relocate(mover, status="在已有地图上定位：原地转一圈"):
+    """Find the body on the map it was given (load or from_live) by one turn in place. Sets its pose."""
+    m, cmap = mover, mover.cmap
+    m.x = m.y = OFF_MAP  # nothing is stamped while it turns
+    m.on_map = False
+    xy, turned = _round_scan(m, status)
+    got = _best_place(cmap, xy)
+    if got is None:
+        raise SystemExit("在地图上找不到雷达这一圈对得上的地方")
+    share, fit, (x, y, a), second = got
     print(f"  定位：转了 {turned:.0f}°，地图上对得最好的是 ({x:+.2f}, {y:+.2f})，朝向 {math.degrees(a):+.0f}°，"
-          f"平均差 {fit * 100:.1f} cm" + (f"；别处最好 {second * 100:.1f} cm" if second is not None else ""), flush=True)
-    if fit > cr.MATCH_OK_M:
-        raise SystemExit(f"在地图上定不了位：最好的地方也差 {fit * 100:.1f} cm（地图可能变了，重新建图）")
-    if second is not None and second - fit < RELOC_MARGIN_M:
-        raise SystemExit("在地图上定不了位：有两个地方对得一样好，挪一下车再试")
+          f"{share:.0%} 的点在地图上（平均差 {fit * 100:.1f} cm）"
+          + (f"；别处最好 {second:.0%}" if second is not None else ""), flush=True)
+    if share < RELOC_MIN_SHARE:
+        raise SystemExit(f"在地图上定不了位：最好的地方也只有 {share:.0%} 的点对得上（地图可能变了，重新建图）")
+    if second is not None and share - second < RELOC_SHARE_MARGIN:
+        raise SystemExit(f"在地图上定不了位：有两个地方对得差不多（{share:.0%} 和 {second:.0%}），挪一下车再试")
     yaw = a + math.radians(turned)
     m.x, m.y, m.yaw = x, y, yaw
     m.yaw0 = m.imu.yaw_deg() - math.degrees(yaw)
     m.hold = None
     m.locate(cr.MATCH_WIN_M)
+    m.on_map = True
     m.show("定位好了")
     return m.pose

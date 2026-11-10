@@ -5,6 +5,7 @@
    thresholds, the user's call, 2026-11-04; a grey chip on the grey carpet and white plastic were
    lost to them). When GrabCut finds nothing that is not most of the box, the box itself, shrunk by
    BOX_SHRINK, stands for the thing (kind "box": its middle is good, its size and direction rough).
+   A plastic bag or wrapper is mostly clear film GrabCut does not see: its whole box (kind "bag").
 3. Its pixels go onto the floor plane through the head camera model (detect_any.to_plane), at
    THICK_M / 2: the thing is too flat for the stereo. Its rotated rectangle gives the middle, the
    long side's direction, its length and its width in the base frame.
@@ -25,11 +26,13 @@ from vln_scene import _numbers, _px, ask_json, cal  # noqa: E402
 PROMPT = """你是机器人的视觉模块。图像来自机器人头部相机，朝下看灰色地毯。
 找出地上每一个小垃圾：纸屑、纸片、纸团、包装碎片、烟头、小塑料片等能用夹子夹起来的小东西，给出紧贴它的框。
 不要框瓶子、家具、电线、地毯本身的花纹和接缝。画面下方和左下方的白色舵机、红白电线、木色板子、蓝色底板和黑色机械臂是机器人自己，不要框。
+塑料袋、包装袋的透明部分也是袋子本身：框整个袋子（包括透明的部分），不要只框印了字、有颜色的那一块。
 只输出 JSON，不要其他文字：{"objects": [{"bbox": [x1, y1, x2, y2], "label": "名字"}, ...]}；没有就输出 {"objects": []}。
 坐标用 0-1000 归一化，图像左上角为 (0,0)，右下角为 (1000,1000)。"""
 
 WRIST_PROMPT = """你是机器人的视觉模块。图像来自机械臂夹爪上的相机，朝下看灰色地毯；画面右侧白色的长条是夹爪自己，不要框。
 框出地毯上的每一个小东西（纸屑、纸片、小塑料片、垫圈等），框要紧贴它。
+塑料袋、包装袋的透明部分也是袋子本身：框整个袋子（包括透明的部分），不要只框印了字、有颜色的那一块。
 只输出 JSON，不要其他文字：{"objects": [{"bbox": [x1, y1, x2, y2], "label": "名字"}, ...]}；没有就输出 {"objects": []}。
 坐标用 0-1000 归一化，图像左上角为 (0,0)，右下角为 (1000,1000)。"""
 
@@ -40,6 +43,13 @@ RING_PX = 25          # GrabCut sees this much carpet round the padded box
 MIN_PX = 20
 THICK_M = 0.002
 SIZE_M = (0.005, 0.12)  # longest side of a thing the jaws can take
+# A plastic bag or wrapper is mostly clear film: GrabCut cut out only a snack bag's printed label, and the
+# jaws went for the label's edge and closed on nothing, twice (2026-11-07). The user: the clear part is
+# the bag, its whole outline is the edge to grasp. For these labels a cut covering less than
+# BAG_CUT_SHARE of the VLM's box (or none) gives way to the whole box. Soft, a bag may be longer.
+BAG_KEYS = ("袋", "包装", "塑料", "透明")
+BAG_CUT_SHARE = 0.5
+BAG_SIZE_M = (0.005, 0.25)
 
 
 def ask(img, model, timeout_s, prompt=PROMPT):
@@ -49,7 +59,8 @@ def ask(img, model, timeout_s, prompt=PROMPT):
     for o in ans.get("objects") or []:
         if not isinstance(o, dict):
             continue
-        b = _numbers(o.get("bbox") or o.get("bbox_2d"), 4)
+        b = next((v for k, v in o.items() if str(k).startswith("bbox")), None)  # bbox, bbox_2d, bbox_
+        b = _numbers(b, 4)
         if b is None:
             continue
         out.append((str(o.get("label") or "小东西"),
@@ -89,11 +100,11 @@ def segment_grabcut(img, box, exclude):
     return out
 
 
-def box_mask(shape, box):
-    """The middle BOX_SHRINK of a box as a mask."""
+def box_mask(shape, box, shrink=BOX_SHRINK):
+    """The middle `shrink` of a box as a mask."""
     out = np.zeros(shape[:2], bool)
     cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
-    hw, hh = max(1.0, (box[2] - box[0]) * BOX_SHRINK / 2), max(1.0, (box[3] - box[1]) * BOX_SHRINK / 2)
+    hw, hh = max(1.0, (box[2] - box[0]) * shrink / 2), max(1.0, (box[3] - box[1]) * shrink / 2)
     out[int(round(cy - hh)):int(round(cy + hh)) + 1, int(round(cx - hw)):int(round(cx + hw)) + 1] = True
     return out
 
@@ -118,7 +129,7 @@ def measure(mask, cam, size=SIZE_M):
 
 def locate_all(img, cam, model, timeout_s, exclude=None):
     """(every small thing the VLM boxed and could be measured, plus "label", "box", "px" and "kind"
-    (grabcut or box: how it was cut out of its box); the labels that could not, with their boxes; a
+    (grabcut, bag or box: how it was cut out of its box); the labels that could not, with their boxes; a
     picture of it all)."""
     vis = img.copy()
     robot = np.zeros(img.shape[:2], np.uint8)
@@ -129,12 +140,18 @@ def locate_all(img, cam, model, timeout_s, exclude=None):
     for label, box in ask(img, model, timeout_s):
         cv2.rectangle(vis, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), (0, 0, 255), 1)
         got = None
-        for kind, cut in (("grabcut", lambda: segment_grabcut(img, box, exclude)),
-                          ("box", lambda: box_mask(img.shape, box) & (robot == 0))):
+        bag = any(k in label for k in BAG_KEYS)
+        cuts = [("grabcut", lambda: segment_grabcut(img, box, exclude)),
+                ("box", lambda: box_mask(img.shape, box) & (robot == 0))]
+        if bag:
+            cuts.insert(1, ("bag", lambda: box_mask(img.shape, box, 1.0) & (robot == 0)))
+        for kind, cut in cuts:
             mask = cut()
             if mask is None or not mask.any():
                 continue
-            got = measure(mask, cam, (0.003, SIZE_M[1]))
+            if bag and kind == "grabcut" and mask.sum() < BAG_CUT_SHARE * (box[2] - box[0]) * (box[3] - box[1]):
+                continue  # the print on a clear bag, not the bag
+            got = measure(mask, cam, (0.003, (BAG_SIZE_M if kind == "bag" else SIZE_M)[1]))
             if got is not None:
                 break
         if got is None:

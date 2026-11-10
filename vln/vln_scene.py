@@ -56,7 +56,6 @@ SELF_TURN_DEG = 30.0               # body turn between the frames that find the 
 SELF_SHARE = 0.6                   # a box this much on the body is the body
 SELF_MAX_SHARE = 0.5               # a mask bigger than this means the body did not really turn
 SELF_TOP = 0.60  # a box on the image bottom that starts in the bottom 40% is the robot's own deck
-UPRIGHT_M = 0.15                   # a box from a bottom corner whose points are this close to the body is its upright
 EDGE_PX = 6
 KEEP_RUNS = 3      # image folders kept under map/look
 STEREO_MIN_Z = 0.10      # the floor itself comes out at about +0.035 m in the base frame
@@ -83,19 +82,48 @@ GLASS_KEYS = ("玻璃", "镜")
 # Small things on the floor the arms pick up. Only once measured no longer than PICK_MAX_M: a big
 # sheet of cardboard called 包装 is an obstacle (paper and bottles are not: ANY_SIZE_KEYS).
 PICK_KEYS = ("垃圾", "纸团", "纸屑", "纸片", "纸巾", "塑料袋", "塑料片", "包装", "瓶", "罐", "果皮", "烟头",
-             "碎屑", "碎片", "食物", "小物件")
+             "碎屑", "碎片", "食物", "小物件", "牛奶盒", "饮料盒")
 PICK_MAX_M = 0.15        # longest side of a thing the grippers take
 # Flat paper on the floor is driven over, whatever it measures: its height comes from the box top and
 # the stereo floor patch, both a few cm off (scraps came out 0.04-0.06 m), and a scrap placed from looks
-# a few cm apart comes out longer than it is. It stays marked for the arms to pick up.
-DRIVE_OVER_KEYS = ("纸屑", "纸片", "纸巾")
-# Bottles and paper balls are to be picked up too, whatever they measure, but driven round, however low
-# they measure: driven over, the body ran into bottles; paper balls are driven round too (user, 2026-11-04).
-DRIVE_ROUND_KEYS = ("瓶", "纸团")
-ANY_SIZE_KEYS = DRIVE_OVER_KEYS + DRIVE_ROUND_KEYS
+# a few cm apart comes out longer than it is. It stays marked for the arms to pick up. Paper balls too
+# (user, 2026-11-07; driven round before, from 2026-11-04): one 0.22 m behind kept the body from
+# turning, and it gave up every thing it was after.
+DRIVE_OVER_KEYS = ("纸屑", "纸片", "纸巾", "纸团")
+# Bottles are to be picked up too, whatever they measure, but driven round, however low they measure:
+# driven over, the body ran into bottles.
+# Milk and drink cartons too: driven over, one would catch under the body (user, 2026-11-06). They keep
+# the size limit (PICK_MAX_M): a carton measured big is a box. Anything with bulk likewise: boxes, cans,
+# cups (user, 2026-11-07, a bottle and a milk carton caught under the body). These names win over the
+# VLM's drive_over verdict.
+DRIVE_ROUND_KEYS = ("瓶", "盒", "罐", "杯")
+ANY_SIZE_KEYS = DRIVE_OVER_KEYS + ("瓶",)
 
 
-BIN_KEYS = ("垃圾桶", "垃圾箱")
+BIN_KEYS = ("垃圾桶", "垃圾箱", "纸篓")
+
+# The lane look asks the VLM itself whether each thing is trash and whether the body may drive over it
+# (LANE_PROMPT "trash", "drive_over"), and the name is its own words: picking a name off a list, it
+# called a milk carton 纸箱 and a paper strip 细杆, and the keyword lists made them obstacles; asked, it
+# judged both right (2026-11-06). The verdict rides on the label as a tag (tagged): to_pick, passable
+# and the size rule read the tag first, the keyword lists only for labels without one (the other
+# prompts, older saved maps).
+TAG_KEEP = "【留】"       # not trash
+TAG_PICK = "【捡】"       # trash, driven round
+TAG_PICK_OVER = "【捡·压】"  # trash the body may drive over
+TAGS = (TAG_PICK_OVER, TAG_PICK, TAG_KEEP)
+
+
+def tagged(label, trash, drive_over):
+    """The label with the VLM's verdict (trash, drive_over: True, False or None when it gave none)."""
+    if trash is None or is_bin(label):
+        return label
+    return label + (TAG_KEEP if not trash else TAG_PICK_OVER if drive_over else TAG_PICK)
+
+
+def label_tag(label):
+    """The verdict tag a label carries, or ""."""
+    return next((t for t in TAGS if t in label), "")
 
 
 def is_bin(label):
@@ -104,15 +132,27 @@ def is_bin(label):
 
 
 def to_pick(label):
-    """A thing the arms pick up, by its name. A trash can holds trash; it is not trash (垃圾)."""
-    return any(k in label for k in PICK_KEYS) and not is_bin(label)
+    """A thing the arms pick up: by the VLM's verdict, else by its name. A trash can holds trash; it is
+    not trash (垃圾)."""
+    if is_bin(label):
+        return False
+    tag = label_tag(label)
+    if tag:
+        return tag != TAG_KEEP
+    return any(k in label for k in PICK_KEYS)
+
+
+def any_size(label):
+    """Trash picked whatever it measures: bottles, paper balls and paper the body may drive over (their
+    measured sizes are a few cm off, ANY_SIZE_KEYS); everything else only up to PICK_MAX_M."""
+    return label_tag(label) == TAG_PICK_OVER or any(k in label for k in ANY_SIZE_KEYS)
 
 
 # Long thin things on the floor: placed along the line the VLM traces through them, not over their box.
 WIRE_KEYS = ("电线", "数据线", "网线", "充电线", "线缆", "绳")
 # Things that lie flat on the floor: the stereo floor patch in their box is them. In the box of anything
 # standing (a cabinet with a plain white front) the floor patch is the floor in front of it.
-FLAT_KEYS = PICK_KEYS + WIRE_KEYS + ("插线板", "充电器", "地毯", "垫", "鞋")
+FLAT_KEYS = PICK_KEYS + WIRE_KEYS + ("插线板", "充电器", "地毯", "垫", "鞋", TAG_PICK, TAG_PICK_OVER)
 WIRE_JUMP_M = 0.30       # traced points this far apart on the floor: the wire left the floor between them
 WIRE_STEREO_PX = 6.0     # a traced point takes the stereo point this close to it, when there is one
 # A thing on legs: the legs are apart and the top joins them. Anything else is one connected body.
@@ -162,18 +202,21 @@ Hit = namedtuple("Hit", "label points sure kind how height top_cut area", defaul
 GLASS_RULE = """如果看到玻璃墙、玻璃门、窗户或镜子：玻璃或镜面一直落到地面、下面没有实心矮墙或踢脚线的，标签写“落地玻璃”或“落地镜子”，框的下边落在它和地面相接处；下面有实心矮墙、踢脚线或柜子挡着的，标签写“玻璃窗”或“镜子”。
 透过玻璃看到的东西、镜子里映出来的东西、越过围栏或墙看到的东西都不在这里，一律不要框。别的墙、围栏、纸板挡板不用框。"""
 
-SELF_RULE = """画面最下方左右两角的白色舵机、红白电线、底边中间的蓝色木色板子，以及从画面下边或两边伸进来的黑色竖杆、管子、支架，是机器人自己，不要框。"""
+# The black side poles that came up from the bottom edges were taken off the body (user, 2026-11-06):
+# told they were the robot, the VLM would leave out a chair leg coming into the picture there.
+SELF_RULE = """画面最下方左右两角的白色机械臂和夹爪、白色舵机、红白电线，底边中间的蓝色木色板子，是机器人自己，不要框。"""
 
 LANE_PROMPT = """你是机器人的视觉模块，场景是办公室，图像来自机器人头部相机，机器人正朝画面中间往前开。机器人本体长 0.30 米、宽 0.50 米、高 0.80 米。
 把地面上和立在地面上的东西都框出来，每件东西一个框，离机器人近的先写，一个都不要漏。
-标签写整件东西的名字，尽量从这些里选：桌子、柜子、书架、椅子、凳子、箱子、纸箱、纸板、包、垃圾桶、人、电线、数据线、插线板、充电器、细杆、支架、鞋，
-地上要捡起来的小东西：纸屑、纸团、纸巾、塑料袋、瓶子、瓶盖、罐子、果皮、烟头、其他小物件。都不合适时写最贴切的名字。
-桌子、柜子、椅子框整件，包括桌面、座面和扶手，标签写“桌子”“柜子”“椅子”，不要写桌面、抽屉、隔板这种部件名。人的脚、鞋、腿都算“人”。
-颜色相同不等于同一种东西：巴掌大以内的碎纸写“纸屑”或“纸团”；比这大的纸板、纸箱，不管平放还是立着，写“纸板”或“纸箱”。
+对每件东西回答三项：
+"label"：它是什么。家具和大件写整件的名字：桌子、柜子、书架、椅子、凳子、纸箱、纸板、包、人、电线、插线板、支架、鞋；桌子、柜子、椅子框整件，包括桌面、座面和扶手，不要写桌面、抽屉、隔板这种部件名；人的脚、鞋、腿都算“人”。
+垃圾桶、垃圾箱、废纸篓一律写“垃圾桶”。塑料瓶、饮料瓶一律写“瓶子”。别的东西用你自己的话写具体名字（例如“牛奶盒”“撕下的纸条”“纸团”“塑料包装袋”）。
+"trash"：它是不是该捡起来扔进垃圾桶的垃圾，true 或 false。家具、电线、插线板、鞋、包、人、纸箱、大纸板、垃圾桶本身都不是垃圾。
+"drive_over"：机器人能不能直接从它上面压过去而不被卡住，true 或 false。很薄、贴地的纸片、纸屑、纸巾和纸团可以；瓶子、盒子、罐子都不行。
 细小的东西也要框；地面上的阴影、反光、污渍、地毯花纹不算。框要包住整个物体，框的下边落在它和地面接触的地方。
 电线、数据线、网线、绳子这类细长的东西，框之外再给出 "line"：沿着它在画面里的走向，从一端到另一端取 3 到 8 个点，每个点都落在线上，格式 [[x, y], ...]，坐标同样用 0-1000 归一化。
 """ + GLASS_RULE + "\n" + SELF_RULE + """
-只输出 JSON，不要其他文字：{"objects": [{"bbox": [x1, y1, x2, y2], "label": "名字"}, {"bbox": [x1, y1, x2, y2], "label": "电线", "line": [[x, y], ...]}, ...]}；什么都没有输出 {"objects": []}。
+只输出 JSON，不要其他文字：{"objects": [{"bbox": [x1, y1, x2, y2], "label": "名字", "trash": false, "drive_over": false}, {"bbox": [x1, y1, x2, y2], "label": "电线", "trash": false, "drive_over": false, "line": [[x, y], ...]}, ...]}；什么都没有输出 {"objects": []}。
 坐标用 0-1000 归一化，图像左上角为 (0,0)，右下角为 (1000,1000)。"""
 
 OVERHEAD_PROMPT = """你是机器人的避障模块，场景是办公室，图像来自机器人头部相机，相机离地约 0.7 米，稍微朝下看，机器人正朝画面中间往前开。
@@ -269,7 +312,9 @@ def _objects(ans):
     out = []
     for obj in objs if isinstance(objs, list) else []:
         # Qwen models have used both bbox and bbox_2d for the same pixel box.
-        box = (_numbers(obj.get("bbox"), 4) or _numbers(obj.get("bbox_2d"), 4)) if isinstance(obj, dict) else None
+        # ... and "bbox_" (qwen3.8-max, 2026-11-07): any key starting with bbox.
+        box = next((b for k, v in obj.items() if str(k).startswith("bbox") for b in [_numbers(v, 4)] if b),
+                   None) if isinstance(obj, dict) else None
         if box is None:
             print(f"  VLM 给的框不是 4 个数，跳过：{obj}", flush=True)
             continue
@@ -278,8 +323,9 @@ def _objects(ans):
         line = None
         if isinstance(obj.get("line"), list):
             line = [(_px(p[0], cal.WIDTH), _px(p[1], cal.HEIGHT)) for p in (_numbers(q, 2) for q in obj["line"]) if p]
-        out.append((object_name(str(obj.get("label") or "障碍")), (x1, y1, x2, y2), line if line and len(line) >= 2 else None,
-                    obj.get("feet") is True))
+        trash = obj.get("trash") if isinstance(obj.get("trash"), bool) else None
+        name = tagged(object_name(str(obj.get("label") or "障碍")), trash, obj.get("drive_over") is True)
+        out.append((name, (x1, y1, x2, y2), line if line and len(line) >= 2 else None, obj.get("feet") is True))
     return out
 
 
@@ -409,7 +455,7 @@ class Head:
         self.taken = None     # callable(map points) -> bools: points on things already known to be something else
         self.last_hits = []
         self.last_floor = []
-        self.glass_spans = []  # bearings (lo, hi rad, base frame) of the glass and mirrors in this stop's pictures
+        self.glass_spans = []  # bearings (lo, hi rad, base frame) of the windows and mirrors on a solid sill in this stop's pictures
         self.last_glass = []   # their feet as lidar polylines (base frame), see _glass_feet
 
     def attach(self, base):
@@ -538,13 +584,16 @@ class Head:
                 continue
             boxes.append(box)
             if any(k in label for k in GLASS_KEYS):
-                rays = self._rays(cam, x1, x2, min(y2, cal.HEIGHT - 1))
-                if rays:
-                    self.glass_spans.append((min(b for b, _ in rays), max(b for b, _ in rays)))
+                # The VLM tells the two apart (GLASS_RULE). On a solid sill the low lidar ranges the
+                # sill and that is the boundary; glass down to the floor the lidar shoots through, so
+                # there the edge where glass meets floor is the boundary and the lidar is not used.
                 if "落地" not in label:
+                    rays = self._rays(cam, x1, x2, min(y2, cal.HEIGHT - 1))
+                    if rays:
+                        self.glass_spans.append((min(b for b, _ in rays), max(b for b, _ in rays)))
                     print(f"  [{tag}] {label}不落地，下面有实心的东西，边界听雷达的", flush=True)
                     continue
-                hit, kept = self._glass(label, box, pts, mask, tag)
+                hit, kept = self._glass(label, box, cam, pts, mask, tag)
             elif (any(k in label for k in BOUNDARY_KEYS)
                   and self._lidar_in(self._rays(cam, x1, x2, min(y2, cal.HEIGHT - 1)), LIDAR_PAD_DEG)):
                 continue  # the lidar sees this wall or fence and maps it
@@ -554,10 +603,6 @@ class Head:
                 hit, kept = self._locate(label, box, cam, pts, mask, tag, line)
             shown |= kept
             if hit is None:
-                continue
-            if (y2 >= cal.HEIGHT - EDGE_PX and (x1 <= EDGE_PX or x2 >= cal.WIDTH - EDGE_PX)
-                    and all(_on_body(px, py, UPRIGHT_M) for px, py in hit.points)):
-                print(f"  [{tag}] 框到的是机器人两侧的立柱（{label}），不算")
                 continue
             hits.append(hit)
             marks.append(((x1 + x2) / 2, min(y2, cal.HEIGHT - 1)))
@@ -785,7 +830,7 @@ class Head:
         kind = "person" if "人" in label else "floor"
         if kind == "floor" and to_pick(label):
             length = floor_size(cells)[0] + (STEREO_CELL_M if how.startswith("双目") else 0.0)
-            if length <= PICK_MAX_M or any(k in label for k in ANY_SIZE_KEYS):
+            if length <= PICK_MAX_M or any_size(label):
                 kind = "trash"
             else:
                 print(f"  [{tag}] {label}量到长 {length:.2f} m，比夹爪能夹的 {PICK_MAX_M:.2f} m 大，当障碍",
@@ -843,11 +888,25 @@ class Head:
             return _densify(line, 0.04) + own, "框底投到地面，雷达对上", own
         return ([], "", []) if cut else (_densify(line, 0.04), "框底投到地面", [])
 
-    def _glass(self, label, box, pts, mask, tag):
-        """Floor-standing glass or a mirror, ranged by the stereo along the box: its frame, kickboard
+    def _glass(self, label, box, cam, pts, mask, tag):
+        """Floor-standing glass or a mirror: where it meets the floor, the box bottom (GLASS_RULE puts
+        it there) projected onto the floor. The lidar is not asked: its beams go through the glass,
+        and what is behind or mirrored in it is left out of the room (behind_glass, OccMap.glass).
+        With that edge below the picture, the stereo along the box ranges it: its frame, kickboard
         and marks on it are the nearest points, reflections and what is behind are farther."""
         x1, y1, x2, y2 = box
         sel = self._usable(pts, box, mask)
+        if y2 < cal.HEIGHT - EDGE_PX:
+            edge = []
+            for k in range(7):
+                f = val.pixel_to_floor(x1 + (x2 - x1) * k / 6.0, y2, cam)
+                if f is not None and math.hypot(f[0], f[1]) <= OBJECT_REACH_M:
+                    edge.append((float(f[0]), float(f[1])))
+            if len(edge) >= 2:
+                edge = _densify(sorted(edge, key=lambda p: math.atan2(p[1], p[0])), 0.04)
+                print(f"  [{tag}] {label}：和地面相接的边投到地面，离车最近 {min(math.hypot(*p) for p in edge):.2f} m，"
+                      "雷达在它后面的回波不用", flush=True)
+                return Hit(label, edge, edge, "glass", "框底投到地面"), sel
         rng = np.hypot(pts[..., 0], pts[..., 1])
         with np.errstate(invalid="ignore"):
             sel &= (pts[..., 2] <= 2.0) & (rng <= 4.0)
@@ -863,7 +922,7 @@ class Head:
             bear = float(np.median(np.arctan2(strip[:, 1], strip[:, 0])))
             line.append((near * math.cos(bear), near * math.sin(bear)))
         if not line:
-            print(f"  [{tag}] {label}在双目看不到的地方，量不出距离，这次边界听雷达的", flush=True)
+            print(f"  [{tag}] {label}和地面相接的边不在画面里，双目也量不出距离，这次不标（雷达穿过玻璃，不用）", flush=True)
             return None, sel
         line = _densify(sorted(line, key=lambda p: math.atan2(p[1], p[0])), 0.04)
         print(f"  [{tag}] {label}：双目量到离车最近 {min(math.hypot(*p) for p in line):.2f} m，"

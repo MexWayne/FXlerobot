@@ -34,7 +34,8 @@ import numpy as np  # noqa: E402
 from coverage_plan import ban_goal, explore_goal, route_to  # noqa: E402
 from live_map import MapView  # noqa: E402
 from occmap import BODY_CLEARANCE_M, BODY_LENGTH_M, BODY_WIDTH_M, OccMap, disk  # noqa: E402
-from vln_scene import ANY_SIZE_KEYS, DRIVE_OVER_KEYS, DRIVE_ROUND_KEYS, PICK_MAX_M, is_bin, to_pick  # noqa: E402
+from vln_scene import (DRIVE_OVER_KEYS, DRIVE_ROUND_KEYS, LANE_PITCHES, PICK_MAX_M, TAG_PICK,  # noqa: E402
+                       TAG_KEEP, TAG_PICK_OVER, any_size, is_bin, label_tag, to_pick)
 
 MAP_DIR = os.path.join(HERE, "map")
 
@@ -55,8 +56,32 @@ SPIN_SAMPLE_S = 0.25
 WARMUP_TURNS = 2
 SURVEY_STOPS = 6      # a survey turn stops this often to look (the camera sees about 65° across)
 SURVEY_GAP_M = 1.0    # a new survey turn only this far from the last one
-SLIP0 = 0.85          # real / commanded distance on this carpet before the lidar has measured it
+SLIP0 = 1.0           # lidar metres per metre the wheels report, before the lidar has measured it
 SLIP_MIN_M = 0.06     # moves shorter than this do not update it
+# Only a move whose lidar metres per wheel metre lie in this range teaches the slip, and the slip stays
+# in it: pushing against a cable and a zigzag out (0.06 m for 0.09-0.16 m of wheels) took it from 0.92
+# to 0.56, the next 0.90 m of wheels was taken for 0.50 m, the lidar no longer matched the map within
+# its window and the body drove on by dead reckoning to the edge of the room (2026-11-07).
+SLIP_RANGE = (0.75, 1.10)
+# Straight moves stop by the wheels' own speeds, read back and added up as the body goes, not by time:
+# timed (dist / speed) they overshot short legs by 4-13 cm at 0.12 m/s, and the demo turned round and
+# round a stage spot 6-14 cm off for minutes (2026-11-06). The wheels roll on a little after the stop
+# command; that is measured after every move (COAST_S: metres rolled per m/s at the stop) and the
+# next move stops that much earlier.
+COAST_S0 = 0.3        # s
+COAST_S_MAX = 1.5
+SLOW_M = 0.05         # the last this many metres slow down ...
+SLOW_LIN = 0.03       # ... to no slower than this (m/s)
+ROLL_MAX_S = 1.0      # after the stop command the wheels are watched this long at most ...
+ROLL_STILL = 0.005    # ... or until they turn slower than this (m/s)
+DRIVE_TIME_FACTOR = 2.0  # a move taking this many times dist / speed (plus 2 s) stops anyway
+# An in-place turn moves the body too: 5-13 cm over 130-170 deg (2026-11-06). Not measured, that went
+# down to the next straight move, which then overshot its goal, turned round and overshot again, and
+# the demo went back and forth round a stage spot for minutes. Turns this big are followed by a lidar
+# match (window TURN_MATCH_WIN_M) once the body is on a map (mover.on_map).
+TURN_LOCATE_DEG = 10.0
+TURN_MATCH_WIN_M = 0.15
+DRAG_FRAC = 0.75     # the body going less than this share of the wheels' way over a bottle: dragging it
 STUCK_FRAC = 0.25     # a move covering less than this share of the command did not move
 STUCK_MOVES_MAX = 3   # stop the whole run after this many stuck moves in a row
 PASS_OVER_M = 0.05    # things to pick up no higher than this are driven over (paper scraps measured 0.04 m)
@@ -69,14 +94,23 @@ MATCH_WIN_M = 0.10    # pose search window: this much plus MATCH_WIN_PER_M of th
 MATCH_WIN_PER_M = 0.5
 MATCH_YAW_DEG = 3.0
 MATCH_OK_M = 0.04     # mean distance of scan points to the map of a fit that is trusted
+# A match that fails in its window is tried again in these wider ones (m, deg): the pose may have run
+# off further than the window allows. On a known map (mover.follow_no_look), after LOST_MAX failures in
+# a row the lidar is matched against the whole map (saved_map.locate_anywhere); found nowhere, the run
+# stops rather than driving on by dead reckoning.
+LOST_WINDOWS = ((0.4, 8.0), (0.8, 12.0))
+LOST_MAX = 2
 LOOK_M = 0.35         # stop and look after this much straight driving
 LOOK_FRESH_S = 3.0    # a look older than this cannot veto a turn
 LOOK_REUSE_S = 30.0   # follow: a look this recent, from the same place, is not taken again
+NO_LOOK_STEP_M = 0.60  # follow without looks (mover.follow_no_look): steps this long, the lidar watching
 STOP_MARGIN = 0.08    # keep this much floor between the body and anything seen ahead
 TURN_SPARE = 0.05     # anything inside the turning circle plus this stops a turn
-TURN_LOOK_DEG = 30.0  # turn in steps the head (NECK_SIDE_MAX plus half the camera view) can look ahead of
+TURN_LOOK_DEG = 45.0  # turn in steps the head (NECK_SIDE_MAX plus half the camera view) can look ahead of
 TURN_CHECK_DEG = 15.0  # smaller turns barely move the corners
-NECK_SIDE_MAX = 15.0  # wider head turns bring the body's own uprights into view
+# Head turned further, the arms fill the bottom corners (learn_self masks them); at 45 deg they take a
+# third of the picture. The side poles that kept it to 15 deg are off the body (2026-11-06).
+NECK_SIDE_MAX = 30.0
 SLIDE_MAX_DEG = 75.0  # unable to turn, the body slides towards legs this far off its heading (the lidar sees about +-80 deg)
 BLIND_SLIDE_M = 0.30  # farther round, where the lidar does not see, only this far and only as far as the map is free
 STEP_OUT_DEG = 15     # directions tried when the planned way is closed
@@ -111,6 +145,12 @@ FOOT_M = 0.10
 NMS_OVERLAP = 0.5
 NMS_SIZE_RATIO = 4.0
 OVERHANG_KEYS = ("桌", "柜", "书架", "货架", "隔板")  # things whose top reaches over the floor
+# A thing this long (its model) is no small thing, whatever its looks' median length: a 1.95 m
+# cardboard model of 71 looks (median 0.11 m) took in paper balls and a white plastic bag beside it,
+# outvoted them and they were never picked (2026-11-07). Looser than PICK_MAX_M: looks a few cm
+# apart spread a small thing's model.
+SMALL_SPREAD_M = 0.30
+ROUND_VETO = 3  # this much vote (one stereo look) for a thing with bulk keeps it driven round (_settle)
 HOW_WEIGHT = {"双目": 3, "雷达+双目": 3, "双目（贴地）": 2, "框底投到地面，雷达对上": 2, "框底投到地面，按雷达": 2,
               "雷达（框伸出画面下沿）": 2, "画面里的线投到地面": 2, "框底投到地面": 1}  # a name's vote by how the look measured the thing
 EXPLORE_VIEW_M = 1.0  # unknown or unvisited floor this close to a spot counts for going there (stereo range)
@@ -124,6 +164,28 @@ RECHECK_M = 0.8
 MAX_LEGS = 400
 GOAL_SWEEP = 0.90
 TRAIL_KEEP = 60
+# Something that moves with the body (a thing left in the jaws, a bag caught on the bumper, a cable
+# hanging in view) is no obstacle. A bottle in the jaws, not known to be there, was mapped 0.18 m ahead
+# at every look: every turn refused, the body backed and slid to and fro until the user cut the power
+# (2026-11-07; the user: any thing may hang in view, not only bottles). Each point of a hit near the body
+# is compared with an earlier look from where a thing on the floor would have shifted at least
+# ATTACH_SHIFT_M: seen there in the same base-frame place, and bare floor (within ATTACH_FLOOR_M, the
+# stereo's floor grid) where a thing on the floor would have been, it votes "on the body"; not seen in
+# the same place but something where it would have been, "on the floor"; else (not in that look's view,
+# hidden) no vote. On the body: at least ATTACH_MIN_PTS votes and ATTACH_RATIO times the floor's, in
+# ATTACH_CONFIRM earlier looks. Bare floor, not just nothing: a wall driven along, or a place the earlier
+# look did not see, passed for "nothing there" in simulation. What is on the body is left out, its marks
+# go, and the cameras leave its place (ATTACH_ZONE_M round its points) alone until the arm moves
+# (body_changed).
+ATTACH_NEAR_M = 0.6
+ATTACH_SHIFT_M = 0.06
+ATTACH_TOL_M = 0.03
+ATTACH_FLOOR_M = 0.04
+ATTACH_RATIO = 2.0
+ATTACH_MIN_PTS = 4
+ATTACH_CONFIRM = 2
+ATTACH_LOOKS = 8
+ATTACH_ZONE_M = 0.04
 RETREAT_STEP_M = 0.10
 RETREAT_MAX_M = 1.5
 BACK_SLANT_DEG = 30.0  # reverse slanted: on the three omni wheels a straight reverse stalls on one wheel
@@ -134,10 +196,14 @@ LOG_KEEP = 5
 
 
 def passable(label, height):
-    """A thing to pick up the body drives over: flat paper (vln_scene.DRIVE_OVER_KEYS), or anything
-    flat enough, but never bottles or paper balls (DRIVE_ROUND_KEYS), however low they measure."""
+    """A thing to pick up the body drives over: as the VLM judged it (vln_scene TAG_PICK_OVER); for a
+    label without a verdict, flat paper (vln_scene.DRIVE_OVER_KEYS), or anything flat enough, but
+    never bottles or cartons (DRIVE_ROUND_KEYS), however low they measure, whatever the VLM said."""
     if any(k in label for k in DRIVE_ROUND_KEYS):
         return False
+    tag = label_tag(label)
+    if tag in (TAG_PICK, TAG_PICK_OVER):
+        return tag == TAG_PICK_OVER
     return any(k in label for k in DRIVE_OVER_KEYS) or (height is not None and height <= PASS_OVER_M)
 
 
@@ -146,7 +212,7 @@ def wrap_deg(d):
 
 
 def _neck(d_yaw):
-    """Head yaw kept where the body's own uprights stay out of the picture (straight or NECK_SIDE_MAX)."""
+    """Head yaw: straight or NECK_SIDE_MAX to the side."""
     if abs(d_yaw) < NECK_SIDE_MAX / 2:
         return 0.0
     return math.copysign(NECK_SIDE_MAX, d_yaw)
@@ -179,12 +245,18 @@ class Mover:
         self.yaw0 = 0.0         # IMU degrees at map heading 0; lidar matches move it
         self.hold = None        # heading (rad) straight moves keep; None: the heading each move starts with
         self.slip = SLIP0
+        self.coast_s = COAST_S0
+        self.on_map = False     # the pose is on a map (built or relocated): turns are followed by a lidar match
+        self.carry_zone = None  # base-frame box (x0, x1, y0, y1) the cameras leave alone (outside_carry)
+        self.lost = 0           # lidar matches failed in a row (locate)
         self.stuck = False
         self.stuck_moves = 0
         self.trail = []         # straight moves made, oldest first: (x0, y0, yaw, rel)
         self.turn_refused = False
         self.stage = ""
         self.look = None        # (pose, time, base-frame points) of the last look
+        self.recent_looks = []  # (pose, base-frame xy of hits, of bare floor near the body) of the last looks (on_body)
+        self.body_things = None  # base-frame xy (N x 2) of what was found to move with the body
         self.objects = []       # things the cameras named and measured, map frame (remember)
         self.glass = []         # feet of windows and mirrors seen, map-frame polylines
         self.next_id = 0
@@ -278,6 +350,8 @@ class Mover:
         self.yaw = self.imu_yaw()
         self.hold = None
         self._passed_turn(start, self.yaw)
+        if self.on_map and abs(deg) >= TURN_LOCATE_DEG:
+            self.locate(TURN_MATCH_WIN_M)
 
     def spin(self, degrees, rate, status, on_sample):
         """Turn `degrees` in place no faster than `rate` deg/s, calling on_sample along the way.
@@ -345,9 +419,12 @@ class Mover:
     def drive(self, rel, dist, status, record=True, guard=True, speed=LIN, count_stuck=True):
         """Move `dist` m towards `rel` rad from the heading, holding the heading (omni wheels).
 
-        The lidar watches the strip the body is about to cover while it moves (only in its view,
-        not behind). Afterwards the pose comes from matching the lidar against the map, which says
-        how far the body really went. Returns those metres.
+        How far it has gone is measured as it goes: the wheels' speeds read back (_wheel_speed), added
+        up and times self.slip (lidar metres per wheel metre). It stops when that and what the wheels
+        will still roll (coast_s times their speed now) make `dist`, slowing down for the last SLOW_M.
+        The lidar watches the strip the body is about to cover while it moves (only in its view, not
+        behind). Afterwards the pose comes from matching the lidar against the map, which says how far
+        the body really went. Returns those metres.
         """
         if dist < 0.01:
             return 0.0
@@ -356,41 +433,56 @@ class Mover:
             del self.trail[:-TRAIL_KEEP]
         x0, y0 = self.x, self.y
         target = self.hold if self.hold is not None else self.imu_yaw()
-        vx, vy = speed * math.cos(rel), speed * math.sin(rel)
+        c, s = math.cos(rel), math.sin(rel)
+        wheels = commanded = 0.0  # metres along `rel`: the wheels reported, the commands asked for
+        v = along = 0.0
         t0 = last = time.time()
-        span = dist / speed
+        limit = dist / speed * DRIVE_TIME_FACTOR + 2.0
         try:
             while True:
                 now = time.time()
-                if now - t0 >= span:
-                    break
+                dt, last = now - last, now
                 self._need_imu()
                 self.yaw = self.imu_yaw()
                 err = wrap_deg(math.degrees(target - self.yaw))
                 if abs(err) > HOLD_ABORT_DEG:
                     self.base.stop()
                     raise SystemExit(f"直行时航向突然偏了 {err:+.0f}°（IMU 跳变 {self.imu.jumps} 次），停车")
-                ahead = self.slip * speed * (now - last)
-                last = now
-                self.x += ahead * math.cos(self.yaw + rel)
-                self.y += ahead * math.sin(self.yaw + rel)
-                if guard and self._lidar_cut(rel, dist * self.slip - math.hypot(self.x - x0, self.y - y0)):
+                got = self._wheel_speed(c, s)
+                along = v if got is None else got  # a missed read: as commanded
+                wheels += along * dt
+                commanded += v * dt
+                self.x += self.slip * along * dt * math.cos(self.yaw + rel)
+                self.y += self.slip * along * dt * math.sin(self.yaw + rel)
+                left = dist - self.slip * (wheels + self.coast_s * max(along, 0.0))
+                if left <= 0.0:
                     break
+                if now - t0 > limit:
+                    print(f"  走了 {limit:.0f} s，轮子只报 {self.slip * wheels:.2f} / {dist:.2f} m，停车", flush=True)
+                    break
+                if guard and self._lidar_cut(rel, left):
+                    break
+                v = speed if left >= SLOW_M else max(SLOW_LIN, speed * left / SLOW_M)
                 # The gyro term brakes a swing before the angle error has grown.
                 theta = max(-HOLD_MAX_RATE, min(HOLD_MAX_RATE, HOLD_KP * err - HOLD_KD * self.imu.rate_dps()))
-                self.base.base.send_action({"x.vel": vx, "y.vel": vy, "theta.vel": theta})
+                self.base.base.send_action({"x.vel": v * c, "y.vel": v * s, "theta.vel": theta})
                 self.show(status)
                 time.sleep(0.05)
         finally:
             self.base.stop()
-        commanded = speed * min(time.time() - t0, span)
-        time.sleep(0.1)
-        located = self.locate(MATCH_WIN_M + MATCH_WIN_PER_M * commanded)
+        rolled = self._roll_out(c, s, rel)
+        wheels += rolled
+        if along > 2 * SLOW_LIN / 3:
+            self.coast_s = min(COAST_S_MAX, max(0.0, 0.5 * self.coast_s + 0.5 * rolled / along))
+        located = self.locate(MATCH_WIN_M + MATCH_WIN_PER_M * self.slip * wheels)
         a = target + rel
         moved = (self.x - x0) * math.cos(a) + (self.y - y0) * math.sin(a)
-        if located and commanded >= SLIP_MIN_M:
-            self.slip = min(1.2, max(0.3, 0.5 * self.slip + 0.5 * moved / commanded))
         self.stuck = located and commanded >= SLIP_MIN_M and moved < STUCK_FRAC * commanded
+        ratio = moved / wheels if wheels > 0 else 0.0
+        if located and wheels >= SLIP_MIN_M and not self.stuck and SLIP_RANGE[0] <= ratio <= SLIP_RANGE[1]:
+            self.slip = min(SLIP_RANGE[1], max(SLIP_RANGE[0], 0.5 * self.slip + 0.5 * ratio))
+        print(f"  [行驶] 要走 {dist:.2f} m：轮子报 {wheels:.2f} m（停车命令后又滚 {rolled:.3f}），"
+              f"雷达量到 {moved:.2f} m；slip {self.slip:.2f} coast {self.coast_s:.2f} s", flush=True)
         if self.stuck and count_stuck:
             self.stuck_moves += 1
             print(f"  命令 {commanded:.2f} m，雷达量到只走了 {moved:.2f} m，车卡住了", flush=True)
@@ -399,8 +491,64 @@ class Mover:
                                  "检查电池电量、轮子是否打滑、底盘有没有被线或家具卡住")
         elif moved > 0.03 and not self.stuck:
             self.stuck_moves = 0
+        over = self._ran_over(x0, y0)
+        if over:
+            print(f"  车身开过了地图上要绕开的{'、'.join(over)}", flush=True)
+            # The wheels going much further than the body, over a bottle or a carton: it is caught under
+            # the body and pushed along (2026-11-07: 0.71 m of wheel for 0.37 m, both under the body).
+            # Clearing its marks as floor the body stood on would hide it: stop instead.
+            if located and wheels >= SLIP_MIN_M and moved < DRAG_FRAC * self.slip * wheels:
+                raise SystemExit(f"车身开过{'、'.join(over)}，轮子转了 {wheels:.2f} m 车只走了 {moved:.2f} m："
+                                 "可能卷到车底了，停车，请检查车底")
         self._passed_line(x0, y0)
         return max(0.0, moved)
+
+    def _ran_over(self, x0, y0):
+        """Names of the things driven round (not passable) the body covered on its way from (x0, y0)
+        to where it is."""
+        cmap = self.cmap
+        n = max(1, int(math.hypot(self.x - x0, self.y - y0) / 0.05))
+        sweep = np.zeros((cmap.h, cmap.w), bool)
+        for k in range(n + 1):
+            sweep |= cmap.body_mask(x0 + (self.x - x0) * k / n, y0 + (self.y - y0) * k / n, self.yaw)
+        sweep &= ~cmap.body_mask(x0, y0, self.yaw)  # what it stood on before is not run over
+        out = []
+        for o in self.objects:
+            if not o.get("trash") or passable(o["label"], o.get("height")):
+                continue
+            # Its core, as the routes keep off it (_trim_marks): a carton model that had taken in a
+            # snack bag and scraps 20-40 cm round it was "driven over" on every route by its outer
+            # points and the run stopped as if it were caught under the body (2026-11-07).
+            cells = [cmap.world_to_cell(x, y) for x, y in (o.get("core") or o["points"])]
+            if any(c is not None and sweep[c] for c in cells):
+                out.append(o["label"])
+        return out
+
+    def _wheel_speed(self, c, s):
+        """Speed (m/s) along the body-frame direction (c, s) the wheels report now, or None."""
+        try:
+            obs = self.base.base.get_observation()
+        except (ConnectionError, RuntimeError, OSError):  # a dropped status packet
+            return None
+        return float(obs["x.vel"]) * c + float(obs["y.vel"]) * s
+
+    def _roll_out(self, c, s, rel):
+        """Wheel metres along (c, s) rolled after the stop command, watched until they stand still
+        (ROLL_STILL) or ROLL_MAX_S; the pose goes along."""
+        rolled, still = 0.0, 0
+        t0 = last = time.time()
+        while time.time() - t0 < ROLL_MAX_S and still < 2:
+            time.sleep(0.03)
+            now = time.time()
+            dt, last = now - last, now
+            along = self._wheel_speed(c, s)
+            if along is None:
+                continue
+            rolled += along * dt
+            self.x += self.slip * along * dt * math.cos(self.yaw + rel)
+            self.y += self.slip * along * dt * math.sin(self.yaw + rel)
+            still = still + 1 if abs(along) < ROLL_STILL else 0
+        return rolled
 
     def _lidar_cut(self, rel, left):
         """True when a lidar return lies in the strip the body covers in the next `left` m."""
@@ -433,9 +581,30 @@ class Mover:
         if got is None:
             return False
         pose, fit = got
+        if fit > MATCH_OK_M and self.on_map:
+            for wide, wide_yaw in LOST_WINDOWS:
+                if wide <= win:
+                    continue
+                again = self.cmap.match(xy, self.pose, wide, wide_yaw)
+                if again is not None and again[1] <= MATCH_OK_M:
+                    print(f"  雷达和地图在 {win:.2f} m 内对不上（平均差 {fit * 100:.0f} cm），放宽到 {wide:.1f} m 找到了",
+                          flush=True)
+                    pose, fit = again
+                    break
         if fit > MATCH_OK_M:
-            print(f"  雷达和地图对不上（平均差 {fit * 100:.0f} cm），位置按推算", flush=True)
-            return False
+            self.lost += 1
+            print(f"  雷达和地图对不上（平均差 {fit * 100:.0f} cm），位置按推算（连着 {self.lost} 次）", flush=True)
+            if self.on_map and getattr(self, "follow_no_look", False) and self.lost >= LOST_MAX:
+                self.base.stop()
+                import saved_map  # here: saved_map imports this module
+                found = saved_map.locate_anywhere(self, xy)
+                if found is None:
+                    raise SystemExit(f"雷达连着 {self.lost} 次和地图对不上，全图也找不到车在哪，停车。"
+                                     "把车放到空的地方，重新启动会原地转一圈重新定位")
+                pose = found
+            else:
+                return False
+        self.lost = 0
         dx, dy = pose[0] - self.x, pose[1] - self.y
         dyaw = wrap_deg(math.degrees(pose[2] - self.yaw))
         if math.hypot(dx, dy) > 0.03 or abs(dyaw) > 1.0:
@@ -489,6 +658,10 @@ def look(mover, head, d_yaw=0.0, near_only=False, pitches=None):
     (remember) and what their looks measured blocks as well. What lies behind a window or mirror
     seen now or before is left out: it is seen through the glass or in the mirror.
     """
+    if mover.carry_zone is not None and d_yaw <= 0:
+        # Carrying, the left arm's load fills the head's left and lower middle (neck yaw + is right):
+        # the head looks right, where nothing hangs in view (the user, 2026-11-07); the lidar sees left.
+        d_yaw = NECK_SIDE_MAX
     pose = mover.pose
     mover.show("停车看前方")
     head.taken = lambda pts: taken(mover, pts)
@@ -499,6 +672,8 @@ def look(mover, head, d_yaw=0.0, near_only=False, pitches=None):
         mover.glass = (mover.glass + new)[-GLASS_KEEP:]
         drop_behind_glass(mover, pose, new)
     hits = through_glass(mover, pose, hits)
+    hits = outside_carry(mover, hits)
+    hits = on_body(mover, pose, hits, head.last_floor)
     now = time.monotonic()
     view = (pose[0], pose[1], math.degrees(pose[2]) - head.pose[0])  # neck yaw + is right
     accepted = []
@@ -537,6 +712,98 @@ def look(mover, head, d_yaw=0.0, near_only=False, pitches=None):
     block_objects(mover)
     show_objects(mover)
     return blocking
+
+
+def outside_carry(mover, hits):
+    """The hits without their points in mover.carry_zone (base-frame box (x0, x1, y0, y1), set while the
+    parked left arm carries something). The cameras saw the bottle hanging from the jaws in front of
+    the bumper, where the lidar is blind, as a thing 0.2 m off: every turn on the way to the can was
+    refused, and the body stayed too far from the can to drop into it (2026-11-06)."""
+    if mover.carry_zone is None:
+        return hits
+    x0, x1, y0, y1 = mover.carry_zone
+
+    def keep(pts):
+        return [p for p in pts if not (x0 <= p[0] <= x1 and y0 <= p[1] <= y1)]
+
+    return [h._replace(points=keep(h.points), sure=keep(h.sure)) for h in hits if keep(h.points)]
+
+
+def body_changed(mover):
+    """The arm moved (a grasp, a drop): what hung from the body may be gone, and earlier looks no
+    longer show it where it hangs now."""
+    mover.recent_looks = []
+    mover.body_things = None
+
+
+def _xy(pts):
+    return np.array([(float(p[0]), float(p[1])) for p in pts]).reshape(-1, 2)
+
+
+def _nearest(a, b):
+    """Distance from each point of a to the nearest of b (both N x 2)."""
+    if not len(b):
+        return np.full(len(a), np.inf)
+    return np.min(np.linalg.norm(a[:, None, :] - b[None, :, :], axis=2), axis=1)
+
+
+def moves_with_body(mover, pose, pts):
+    """True when the base-frame points `pts` seen from `pose` are on the body (see ATTACH_*)."""
+    xy = _xy(pts)
+    xy = xy[np.hypot(xy[:, 0], xy[:, 1]) <= ATTACH_NEAR_M]
+    if len(xy) < ATTACH_MIN_PTS:
+        return False
+    confirmed = 0
+    for pose0, seen, floor in mover.recent_looks:
+        # Where each point would have been in that look, were it lying on the floor.
+        was = np.array([to_robot(pose0, to_map(pose, p)) for p in xy])
+        moved = np.linalg.norm(was - xy, axis=1) >= ATTACH_SHIFT_M
+        if moved.sum() < ATTACH_MIN_PTS:
+            continue
+        same = _nearest(xy[moved], seen) <= ATTACH_TOL_M
+        there = _nearest(was[moved], seen) <= ATTACH_TOL_M
+        bare = (_nearest(was[moved], floor) <= ATTACH_FLOOR_M) & ~there
+        body, on_floor = int((same & bare).sum()), int((~same & there).sum())
+        if body >= ATTACH_MIN_PTS and body >= ATTACH_RATIO * on_floor:
+            confirmed += 1
+    return confirmed >= ATTACH_CONFIRM
+
+
+def on_body(mover, pose, hits, floor):
+    """The hits without what moves with the body (moves_with_body, or within ATTACH_ZONE_M of what was
+    found to); what is found now loses its marks on the map and its models. floor: base-frame points
+    the look measured as bare floor."""
+    zone = mover.body_things
+
+    def off_body(pts):
+        if zone is None or not len(pts):
+            return list(pts)
+        return [p for p, d in zip(pts, _nearest(_xy(pts), zone)) if d > ATTACH_ZONE_M]
+
+    kept, found = [], []
+    for h in hits:
+        h = h._replace(points=off_body(h.points), sure=off_body(h.sure))
+        if not h.points:
+            continue
+        (found if h.kind != "glass" and moves_with_body(mover, pose, h.points) else kept).append(h)
+    near = _xy([p for h in kept + found for p in h.points])
+    near = near[np.hypot(near[:, 0], near[:, 1]) <= ATTACH_NEAR_M]
+    bare = _xy(floor)
+    bare = bare[np.hypot(bare[:, 0], bare[:, 1]) <= ATTACH_NEAR_M + ATTACH_SHIFT_M * 3]
+    for h in found:
+        xy = _xy(h.points)
+        print(f"  {h.label or '这个东西'}跟着车一起动（车挪了，它在车身上的位置没变）：是挂在车上的，不算障碍", flush=True)
+        cmap = mover.cmap
+        marks = np.zeros((cmap.h, cmap.w), bool)
+        for pose0, _, _ in mover.recent_looks:
+            marks |= cmap.mask_of([to_map(pose0, p) for p in xy], ATTACH_TOL_M)
+        cmap.clear_vis(marks)
+        mover.objects = [o for o in mover.objects
+                         if not (o["foot"].any() and (o["foot"] & marks).sum() >= 0.5 * o["foot"].sum())]
+        cmap.rebuild()
+        mover.body_things = xy if mover.body_things is None else np.vstack([mover.body_things, xy])
+    mover.recent_looks = (mover.recent_looks + [(pose, near, bare)])[-ATTACH_LOOKS:]
+    return kept
 
 
 def confirmed_overhang(mover, view, pts):
@@ -689,7 +956,14 @@ def _same(cmap, obj, label, foot, points):
     up are one by overlap alone, as boxes in object detection: the body had driven over a bottle, and
     the stood check made 26 bottles within 20 cm of it, one per look (2026-11-04).
     """
-    if is_bin(label) != is_bin(obj["label"]) or to_pick(label) != to_pick(obj["label"]):
+    if is_bin(label) != is_bin(obj["label"]):
+        return False
+    # A small thing judged trash in one look and not in another is still one thing, and its votes
+    # decide (_settle); a small thing beside a big one that is no trash (a bottle under a tripod)
+    # stays apart.
+    small = (obj.get("size", obj["length"]) <= PICK_MAX_M and obj["length"] <= SMALL_SPREAD_M
+             and _rect(list(points))[1] <= PICK_MAX_M)
+    if to_pick(label) != to_pick(obj["label"]) and not small:
         return False
     a, b = int(obj["foot"].sum()), int(foot.sum())
     inter = int((obj["foot"] & foot).sum()) if a and b else 0
@@ -699,7 +973,7 @@ def _same(cmap, obj, label, foot, points):
         same = label == obj["label"] or max(a, b) <= NMS_SIZE_RATIO * min(a, b)
     else:
         same = label == obj["label"]
-    if to_pick(label) and to_pick(obj["label"]):
+    if (to_pick(label) and to_pick(obj["label"])) or (small and (to_pick(label) or to_pick(obj["label"]))):
         return same
     return same and not _covers_stood(cmap, _rect(obj["points"] + list(points))[0])
 
@@ -735,8 +1009,28 @@ def _core(obj):
 
 
 def _settle(obj, cmap):
-    """Name, measures and kind of a thing after its looks changed: the name with the most evidence."""
-    obj["label"] = max(obj["names"], key=obj["names"].get)
+    """Name, measures and kind of a thing after its looks changed: the VLM's verdict (trash or not, may
+    be driven over) with the most evidence over all names, then of the names with it the best."""
+    votes = {}
+    for name, score in obj["names"].items():
+        votes[label_tag(name)] = votes.get(label_tag(name), 0) + score
+    tag = max(votes, key=votes.get)
+    # Driven over only if nothing says it has bulk: scraps lying by a bottle and a milk carton merged
+    # into them and outvoted them (7 bottle against 13 for five paper names), the thing was driven
+    # over and both caught under the body (2026-11-07).
+    bulk = sum(s for n, s in obj["names"].items()
+               if label_tag(n) in (TAG_PICK, TAG_KEEP) or any(k in n for k in DRIVE_ROUND_KEYS))
+    if tag == TAG_PICK_OVER and bulk >= ROUND_VETO:
+        # Still trash, only driven round: a paper ball named 纸箱/纸板【留】 in some looks (7 against 12)
+        # went to 【留】 that way and was off the list (2026-11-07).
+        if TAG_PICK not in votes:
+            best = max((n for n in obj["names"] if label_tag(n) == tag), key=obj["names"].get)
+            obj["label"] = best.replace(TAG_PICK_OVER, TAG_PICK)
+            tag = None
+        else:
+            tag = TAG_PICK
+    if tag is not None:
+        obj["label"] = max((n for n in obj["names"] if label_tag(n) == tag), key=obj["names"].get)
     obj["core"] = _core(obj)
     obj["foot"] = _footprint(cmap, obj["core"])
     obj["rect"], obj["length"], obj["width"], obj["heading"] = _rect(obj["core"])
@@ -746,8 +1040,7 @@ def _settle(obj, cmap):
         obj["top_cut"] = 2 * sum(obj.get("cuts") or []) > len(obj.get("cuts") or [])
     # Each look's own length: put together, looks placed a few cm apart spread a small thing out.
     obj["size"] = float(np.median(obj["sizes"])) if obj.get("sizes") else obj["length"]
-    obj["trash"] = to_pick(obj["label"]) and (
-        obj["size"] <= PICK_MAX_M or any(k in obj["label"] for k in ANY_SIZE_KEYS))
+    obj["trash"] = to_pick(obj["label"]) and (obj["size"] <= PICK_MAX_M or any_size(obj["label"]))
 
 
 def remember(mover, hit, pts, area=()):
@@ -888,23 +1181,40 @@ def _occupied_near(mover, limit, skip_body=True):
 def turn_blocker(mover):
     """Something inside the circle the corners sweep: the lidar now, a fresh look, or the map."""
     limit = BODY_CLEARANCE_M + TURN_SPARE
-    near = []
+    near = []  # (point, where from): the where only for the diagnostic line below
     xy = mover.lidar.latest_xy()
     if xy is not None:
-        near += [(float(x), float(y)) for x, y in xy if math.hypot(float(x), float(y)) <= limit]
+        near += [((float(x), float(y)), "雷达") for x, y in xy if math.hypot(float(x), float(y)) <= limit]
     if mover.look is not None:
         pose, t, pts = mover.look
         if (time.monotonic() - t < LOOK_FRESH_S and math.hypot(mover.x - pose[0], mover.y - pose[1]) < 0.03
                 and abs(wrap_deg(math.degrees(mover.yaw - pose[2]))) < 3.0):
-            near += [p for p in pts if math.hypot(*p) <= limit]
-    near += _occupied_near(mover, BODY_CLEARANCE_M + 0.02)[:1]
-    return min(near, key=lambda p: math.hypot(*p)) if near else None
+            near += [(p, "相机") for p in pts if math.hypot(*p) <= limit]
+    near += [(p, "地图") for p in _occupied_near(mover, BODY_CLEARANCE_M + 0.02)[:1]]
+    if not near:
+        return None
+    p, why = min(near, key=lambda e: math.hypot(*e[0]))
+    # Diagnostics (2026-11-06): which layer of the map, and how many lidar returns, made a turn refused.
+    cmap = mover.cmap
+    cell = cmap.world_to_cell(*to_map(mover.pose, p))
+    if why == "地图" and cell is not None:
+        now = time.monotonic()
+        layers = {"雷达层": cmap._lidar, "相机层": cmap.vis_end > now, "垃圾": cmap.trash, "贴地垃圾": cmap.trash_low,
+                  "物体": cmap.objects & ~cmap.stood, "玻璃": cmap.glass}
+        why += "/" + ",".join(k for k, v in layers.items() if v[cell])
+    lidar_n = sum(1 for _, w in near if w == "雷达")
+    print(f"  [转身挡] {why} 点 ({p[0]:+.2f}, {p[1]:+.2f}) 离车 {math.hypot(*p):.2f} m "
+          f"方位 {math.degrees(math.atan2(p[1], p[0])):+.0f}°；雷达近点 {lidar_n} 个", flush=True)
+    return p
 
 
-def map_room(mover, rel, limit):
-    """Metres the body can move towards `rel` before it covers an occupied map cell it is not on now."""
+def map_room(mover, rel, limit, ignore=None):
+    """Metres the body can move towards `rel` before it covers an occupied map cell it is not on now
+    (nor in the mask `ignore`: the thing it goes up to)."""
     cmap = mover.cmap
     occ = cmap.occupied() & ~cmap.body_mask(*mover.pose)
+    if ignore is not None:
+        occ &= ~ignore
     a = mover.yaw + rel
     d = 0.0
     while d < limit:
@@ -1014,17 +1324,25 @@ def follow(mover, head, route, status):
             # Not moved since the last look (same place, same head yaw, LOOK_REUSE_S ago at most):
             # that look again. Hemmed in where it could not turn, it looked up and down at the same
             # bottle, strip and wire for every next spot it tried (2026-11-05).
+            # mover.follow_no_look (a caller on a known map): no camera looks at all, the lidar and the
+            # map keep the way, in NO_LOOK_STEP_M steps. A trip to the trash can with looks took 27 of
+            # a 52 min run, 412 VLM calls ~21 min in all (2026-11-05).
             d_yaw = _neck(-math.degrees(rel))
             last = getattr(mover, "last_hits", None)
-            if (last is not None and last[0] == d_yaw and time.monotonic() - last[2] < LOOK_REUSE_S
+            no_look = getattr(mover, "follow_no_look", False)
+            if no_look:
+                hits = []
+            elif (last is not None and last[0] == d_yaw and time.monotonic() - last[2] < LOOK_REUSE_S
                     and math.hypot(mover.x - last[1][0], mover.y - last[1][1]) < 0.03
                     and abs(wrap_deg(math.degrees(mover.yaw - last[1][2]))) < 3.0):
                 hits = last[3]
             else:
-                hits = look(mover, head, d_yaw=d_yaw, near_only=getattr(mover, "follow_near_only", False))
+                near = getattr(mover, "follow_near_only", False)  # the near floor only, no look up
+                hits = look(mover, head, d_yaw=d_yaw, pitches=(LANE_PITCHES[-1],) if near else None)
                 mover.last_hits = (d_yaw, mover.pose, time.monotonic(), hits)
-            free = free_ahead(mover, hits, rel)
-            step = min(LOOK_M, d, free)
+            limit = NO_LOOK_STEP_M if no_look else LOOK_M
+            free = free_ahead(mover, hits, rel, limit)
+            step = min(limit, d, free)
             if step < 0.03:
                 print(f"  {'前方' if rel == 0.0 else '平移方向上'}只剩 {free:.2f} m，换路", flush=True)
                 return "blocked"
@@ -1224,6 +1542,7 @@ def warm_up(mover, head):
         raise SystemExit("出发的地方转不开身：把车放到四周 0.4 m 内没有东西的地方")
     print(f"阶段 1/3 建图：原地以 {SPIN_DPS:.0f}°/s 慢转 {WARMUP_TURNS} 圈，只用雷达")
     mover.spin(360.0 * WARMUP_TURNS, SPIN_DPS, "建图：雷达转圈", mover.sample_lidar)
+    mover.on_map = True
     print(f"  雷达建图：已知空地 {mover.cmap.stats()['free_m2']:.1f} m²")
     survey(mover, head, "建图：视觉看一圈")
 

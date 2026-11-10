@@ -25,7 +25,6 @@ UNKNOWN, BODY_REACH, ARM_ONLY, BODY_DONE, ARM_DONE, BLOCKED, TRASH = range(7)
 
 BODY_LENGTH_M = 0.30
 BODY_WIDTH_M = 0.50
-BODY_HEIGHT_M = 0.80
 # Center to a base corner: the in-place turn radius.
 BODY_CLEARANCE_M = math.hypot(BODY_LENGTH_M / 2.0, BODY_WIDTH_M / 2.0)
 PLAN_MARGIN_M = 0.04  # extra room kept when planning, for pose error
@@ -184,14 +183,6 @@ class OccMap:
         if len(xy):
             mask = self.mask_of(xy, radius)
             self.vis_end[mask] = np.maximum(self.vis_end[mask], until)
-
-    def fill(self, poly, until):
-        """Camera obstacle over a whole polygon (map frame): the floor under a table."""
-        mask = np.zeros((self.h, self.w), np.uint8)
-        pts = np.array([[(x - self.origin[0]) / self.res, (y - self.origin[1]) / self.res] for x, y in poly])
-        cv2.fillPoly(mask, [np.round(pts).astype(np.int32)], 1)
-        sel = mask > 0
-        self.vis_end[sel] = np.maximum(self.vis_end[sel], until)
 
     def mark_glass(self, xy):
         self.glass |= self.mask_of(xy, self.res)

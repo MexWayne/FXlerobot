@@ -82,6 +82,14 @@ LIFTED_MIN_M = 0.10
 PARK = {"shoulder_pan": 3.0, "shoulder_lift": -97.0, "elbow_flex": -16.0, "wrist_flex": 99.0,
         "wrist_roll": -94.0, "gripper": -60.0}
 PARK_DEG_S = 30.0
+# Carrying: the arm swung in over the body (CARRY, posed by the user by hand, 2026-11-08): the jaws above
+# the front middle of the body (base x 0.12, y 0.02, 0.36 m up), what they hold hanging over the deck,
+# inside the body's outline and out of both head cameras' view. Held at PARK a bottle filled the lower
+# left of the view; leaned forward from PARK (shoulder_lift -60, 2026-11-07) it still hung in front of
+# the bumper in every look, and the trips to the can were slow. From PARK the joints' straight way goes
+# in over the body, the jaws sinking steadily from 0.51 to 0.36 m. shoulder_pan was posed at 89.4, past
+# the arm's limit (89.0, LIMIT_MARGIN_DEG inside its range): the first stow refused to move (2026-11-10).
+CARRY = {"shoulder_pan": 88.5, "shoulder_lift": -80.8, "elbow_flex": 34.3, "wrist_flex": 95.9, "wrist_roll": -93.6}
 CARRY_DEG_S = 15.0  # with a bottle hanging from the gripper, so it does not swing
 FREE_DEG_S = 50.0  # through the air
 NEAR_DEG_S = 25.0  # down onto the cap and lifting the bottle
@@ -143,6 +151,20 @@ def move(arm, q, speed, label):
     t0 = time.monotonic()
     got = arm.move(q, speed)
     print(f"{label} {time.monotonic() - t0:.1f}s：{fmt(got)}")
+    return got
+
+
+def move_path(arm, path, speed, label):
+    """move() through all of `path` (joint dicts) without stopping between, each stretch checked."""
+    now = arm.deg()
+    for a, b in zip([now] + path, path):
+        full_a, full_b = {**now, **a}, {**now, **b}
+        z = [tip_base({k: full_a[k] + (full_b[k] - full_a[k]) * s for k in now})[2] for s in np.linspace(0, 1, 11)]
+        if min(z) < min(z[0], z[-1]) - PATH_CLEAR_M or min(z) < min(MIN_TIP_Z_M, z[0] - 0.001):
+            raise SystemExit(f"{label}：路上爪尖会低到 {min(z) * 1000:.0f} mm，不动")
+    t0 = time.monotonic()
+    got = arm.move_path(path, speed)
+    print(f"{label}（{len(path)} 个路点，不停顿）{time.monotonic() - t0:.1f}s：{fmt(got)}")
     return got
 
 
@@ -264,22 +286,34 @@ def bottle_height(d, run, tag):
     return float(pts[0][2]) if reproj.max() <= MAX_REPROJ_PX else None
 
 
-def park(arm, keep_grip=False):
-    """To PARK. keep_grip: leave the gripper where it is (still holding what it holds), move slowly."""
+def park(arm, keep_grip=False, speed=None):
+    """To PARK. keep_grip: leave the gripper where it is (still holding what it holds), move slowly
+    (CARRY_DEG_S, a bottle hanging; speed: another, e.g. for a light small thing that does not swing)."""
     target = {k: v for k, v in PARK.items() if not (keep_grip and k == "gripper")}
     now = arm.deg()
     if max(abs(now[k] - v) for k, v in target.items()) < 3:
         return
     if tip_base(now)[2] < HOVER_M:
         # Low (e.g. jaws still at a cap): straight up first so nothing is dragged along the floor.
-        T = mount.load()
         offset = ik.tcp_offset(CAP_RADIUS_M + JAW_CLEARANCE_M)
         p, _, close = ik.pose(now, offset)
         axis = np.cross(close, [0, 0, 1.0])
         q, err = ik.solve(p + [0, 0, HOVER_M], axis / np.linalg.norm(axis), offset, joint_limits(), [now])
         if err < 3:
             move(arm, q, NEAR_DEG_S, "竖直抬起")
-    move(arm, target, CARRY_DEG_S if keep_grip else PARK_DEG_S, "收臂")
+    move(arm, target, speed or (CARRY_DEG_S if keep_grip else PARK_DEG_S), "收臂")
+
+
+def stow(arm):
+    """What the gripper holds, from PARK to CARRY over the body, out of the head cameras' view. The
+    gripper stays as it is."""
+    move(arm, CARRY, CARRY_DEG_S, "拿着的东西收到车身上方，让开相机")
+
+
+def unstow(arm):
+    """Back from stow() to PARK, where arm_drop's way out over the can starts. Does no harm on an
+    arm already at PARK."""
+    move(arm, {k: v for k, v in PARK.items() if k != "gripper"}, CARRY_DEG_S, "收回 PARK")
 
 
 def cmd_auto(args):

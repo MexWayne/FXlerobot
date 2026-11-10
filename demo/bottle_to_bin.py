@@ -7,7 +7,7 @@
   python bottle_to_bin.py --bin-height 0.32  # 桶口离地 0.32 m（量不准或桶顶出了画面时给）
   python bottle_to_bin.py --no-explore --no-bin  # 测试：建完图不探索，去捡已看到的垃圾，拿着就停
   python bottle_to_bin.py --use-map --no-explore  # 用上次存的地图：原地转一圈定位，不建图
-  python bottle_to_bin.py --rescan                # 用上次存的地图定位，到几个观察点低头看一圈找垃圾，捡起扔掉
+  python bottle_to_bin.py --rescan                # 用上次存的地图定位，看到的垃圾先捡起扔掉，再去下一个观察点看、捡
   python bottle_to_bin.py --rescan --patrol 3     # 同上，捡完后每 3 分钟再巡视一圈，看到新垃圾就去捡（Ctrl-C 停）
   python bottle_to_bin.py --rescan --holding 0.16 # 左臂上还夹着上次没扔掉的 16 cm 瓶子：定位后先扔掉它
 
@@ -18,7 +18,7 @@
 
 1) 建图：vln 的预热（雷达转两圈 + 视觉看一圈），地图、物体建模、定位都用 vln 的。
 2) 探索：vln 的深度优先探索，把能到的地方都走完；探索完再看地图上有没有垃圾桶、有哪些垃圾。
-   没有垃圾桶就停下说明，一个也不捡。垃圾怎么走（vln_scene）：瓶子、纸团绕着走，纸屑、纸片、纸巾压过去也行。
+   没有垃圾桶就停下说明，一个也不捡。垃圾怎么走（vln_scene）：瓶子绕着走，纸屑、纸片、纸巾、纸团压过去也行。
 3) 统计：地图上认作垃圾的东西（名字、瓶子还是小件、位置、第一次看到的时间、结果）记在台账里，
    每轮捡完打印，存到 runs/trash_ledger.json。
 4) 瓶子：按地图开到瓶子在车头前方约 0.6 m 的地方（停车位置和朝向一起选，转不了身就换个地方），头转到抓取视角（yaw -15, pitch 35），
@@ -43,6 +43,7 @@ import os
 import signal
 import sys
 import time
+import types
 from pathlib import Path
 
 import cv2
@@ -95,6 +96,11 @@ FIND_SLIDES = 3               # slides towards the map's bottle while the grasp 
 FAST_LIN = 0.12
 FAST_STEP_M = 0.6
 FAST_TURN_TOL_DEG = 5.0
+# A corner this near is slid to on the omni wheels, the heading kept, where the map leaves room: a turn
+# in place moves the body 6-13 cm itself, and turning to face a corner 6-15 cm off it overshot, turned
+# round and overshot again for minutes (2026-11-06). Within FAST_ARRIVE_M the corner is reached.
+FAST_SLIDE_M = 0.30
+FAST_ARRIVE_M = 0.05
 # Looking for bottles: a turn in place in QUICK_STOPS steps, each one look at the floor at QUICK_PITCHES
 # (pitch 10 sees the floor 0.4-1.7 m out). The places are picked so that all open floor lies within
 # VIEW_R_M of one (greedy, the best new cover first), at most VIEW_MAX of them.
@@ -113,6 +119,17 @@ CAP_Y = 0.06
 # at the cap itself the jaws came down beyond its end and closed on nothing; 17.5 mm along caught
 # its edge, and the user put it 1 cm further (2026-11-04, the wrist half round).
 GRASP_ALONG_M = 0.027
+# A crushed (trodden flat) bottle is grasped by the cap itself (the user, 2026-11-07): at GRASP_ALONG_M
+# the jaws closed on its flattened neck (-54/-56 deg, against -45 on a cap) and it slid out on the lift
+# twice. Crushed: its body measured this wide (radius; the two crushed grasps 0.044-0.045, round bottles
+# 0.029-0.038). Asked, the VLM called every bottle crushed, round ones too.
+CRUSHED_ALONG_M = 0.015
+CRUSHED_R_M = 0.042
+# A lying bottle's cap is grasped this high at most (the grasp point; the fixed-jaw tip 12 mm lower),
+# whatever the stereo said: since 2026-11-06 grasps planned at the cap's measured 17-31 mm held (4 of 4)
+# and at 35-41 mm 5 of 5 missed, the jaws closing over the top of the cap (2026-11-07). The stereo
+# read those caps up to 1 cm above their middle, which lies about a body radius (~3 cm) up.
+CAP_Z_MAX_M = 0.022
 # Grasp with the wrist half round: the left wrist camera then looks at the cap and the jaws.
 FLIP_GRASP = True
 
@@ -128,9 +145,9 @@ def lift_heights(length, cut):
     return (need, need - 0.03, 0.20)
 
 
-def grasp_nudge_mm(axis):
+def grasp_nudge_mm(axis, along=GRASP_ALONG_M):
     """pick.py's nudge (base frame, mm) for a bottle along `axis` (cap -> body, unit)."""
-    return (np.asarray(axis, float) * GRASP_ALONG_M * 1000.0).tolist()
+    return (np.asarray(axis, float) * along * 1000.0).tolist()
 BOTTLE_CLEAR_X = 0.20         # no part of the bottle nearer than this when the body has stopped
 TURN_CLEAR_M = 0.38           # the body corners sweep 0.29 m: turn only with the bottle beyond this
 POINTS_AT_BODY = -0.6         # bottle axis this much along -x points at the body: turn it across
@@ -142,6 +159,10 @@ FINE_LIN = 0.05               # m/s for the last few centimetres
 # more at KICK_LIN for what is left, and if that does not move either only this piece is given up.
 KICK_LIN = 0.10
 SEEN_VS_MAP_M = 0.30          # the cameras' bottle this far from the map's is another thing
+# A can measured this far from the map's is another one (or a reflection): beside can 15, a can
+# 2.19 m off was measured, the body slid 1.88 m towards it, the lidar stopped it and the run ended with
+# a bottle in the jaws (2026-11-07).
+BIN_VS_MAP_M = 0.50
 PICK_TRIES = 2
 HANG_CUT_M = 0.22             # a bottle partly out of view hangs at least this far (its length is not known)
 MIN_HANG_M = 0.10             # the shortest bottle: a can too tall even for it is not worth a pick
@@ -153,6 +174,12 @@ SMALL_AT = (0.26, 0.10)
 SMALL_TOL_M = 0.03            # slides until the thing is this close to SMALL_AT
 SMALL_STEPS = 4
 SMALL_HANG_M = 0.04           # a small thing reaches this far below the grasp point, over the can
+# Parked, the jaws go to pick.PARK's gripper; stopped this far short of it, something is between them.
+# A run started with a bottle still in the jaws and no --holding took it for a bottle 0.2 m ahead: every
+# turn was refused and the body slid and backed to and fro until the user cut the power (2026-11-07).
+# A cap stops the jaws at about -45, a thin plastic scrap at -56.8; empty at PARK they read -59.3..-60.7
+# (with the rubber strips, 2026-11-10).
+HELD_DEG = 2.0
 LEDGER = RUNS / "trash_ledger.json"
 # A "bottle" this close to a trash can is one already thrown in, seen over the rim: going for it the body
 # slid on into the can and knocked over the stand beside it (2026-11-04). Measured can: within its
@@ -163,15 +190,12 @@ BIN_AT = (0.62, 0.15)
 BIN_Y = 0.15
 BIN_GAP_M = 0.04              # between the bumper and the can
 BIN_R_DEFAULT = 0.12
-BIN_R_RANGE = (0.06, 0.25)
-BIN_LIDAR_M = 0.15            # lidar returns this far round the can's expected wall are the can
 BIN_TOL_M = 0.02
-# Rim: the highest stereo points over the can's circle, head level (the can 0.6 m off fills the
-# lower half of the picture, rim included), median of a few pairs. vln's stereo calibration reads
-# distances ~5% short, which puts a 0.3 m rim ~1.5 cm high: on the safe side.
-RIM_PITCH = 0.0
-RIM_SHOTS = 3
-RIM_MIN_PTS = 30
+# Where the can may stand for the drop instead (drop_goal), when the way to the usual place is blocked:
+# this much further ahead / to the side of it (base frame) (drop_goal).
+DROP_SHIFT_X_M = (0.0, 0.05, 0.10)
+DROP_SHIFT_Y_M = (0.0, -0.05, 0.05, -0.10, -0.15, -0.20, -0.25)
+STAGE_ACCEPT_CHECKS = 20  # go_stage's accept is asked about this many of the best spots at most
 # The can is found by detection first: the head turned to it, the VLM's box gives its bearings, and
 # only lidar returns within them count. A black wire-mesh can let most beams through (13 returns) and
 # the arc fit took the tripod's legs behind it for the can: 0.21 m right of the body where the can stood
@@ -217,7 +241,12 @@ def wrap(a):
 
 
 class Fail(Exception):
-    """This bottle or can cannot be done now; the run goes on."""
+    """This bottle or can cannot be done now; the run goes on. retry False: no point in another go
+    (too big for the jaws, out of the arm's reach where the body cannot get nearer)."""
+
+    def __init__(self, msg, retry=True):
+        super().__init__(msg)
+        self.retry = retry
 
 
 class Fetcher:
@@ -225,7 +254,9 @@ class Fetcher:
         self.mover, self.head, self.base, self.arm, self.args = mover, head, base, arm, args
         self.skip = []      # map points of things done or given up
         self.done = 0
+        self.held_dropped = False  # drop_held put what --holding held into the can
         self.bin_at = None  # (centre in the map frame, radius, rim height) once measured
+        self.drop_cache = {}  # drop_reaches
         self.ledger = []    # every piece of trash seen: label, kind, map x/y, first seen, result
         self.later = []     # where pieces given up this round lay: one more go at the end
         self.second_go = False
@@ -253,10 +284,12 @@ class Fetcher:
 
     def targets(self):
         """The trash on the map still to fetch, nearest first: what vln marked as trash (vln_scene
-        to_pick, in size), not in a can, not done or given up."""
+        to_pick, in size), not in a can, not done or given up; with --only, of that kind only."""
         out = []
         for o in self.mover.objects:
             if not (o.get("trash") and to_pick(o["label"])):
+                continue
+            if self.args.only and self.kind(o) != self.args.only:
                 continue
             if self.kind(o) == "bottle" and o.get("size", o["length"]) > BOTTLE_MAX_M:
                 continue
@@ -336,18 +369,26 @@ class Fetcher:
                 out.append((score, cell, h, (x, y), ax))
         return sorted(out)
 
-    def go_stage(self, target, at, axis_deg=None, status=""):
+    def go_stage(self, target, at, axis_deg=None, status="", accept=None):
         """Drive to where map point `target` lies at base-frame `at` (or up to STAGE_FARTHER_M further
         ahead), facing it. With the target's long side known (axis_deg, map frame) headings across it
         come first. The spots are worked out again from the map after every miss: a can standing in
         clutter beyond the drivable floor had three spots, all on that floor's edge, and when looks on
-        the way moved the edge the first went and the other two were lost unsaid (2026-11-05)."""
+        the way moved the edge the first went and the other two were lost unsaid (2026-11-05).
+        accept(place, heading, ax): a spot it turns down, while one of the best STAGE_ACCEPT_CHECKS is
+        taken; when none is, the best as before."""
         m, cmap = self.mover, self.mover.cmap
         tried, hemmed = [], 0
         for attempt in range(STAGE_TRIES):
             spots = self.stage_spots(target, at, axis_deg, tried)
             if not spots:
                 break
+            if accept is not None:
+                good = [sp for sp in spots[:STAGE_ACCEPT_CHECKS] if accept(sp[3], sp[2], sp[4])]
+                if good:
+                    spots = good
+                else:
+                    print("  附近的停靠点都不合适，先去最近的", flush=True)
             _, cell, h, place, ax = spots[0]
             tried.append(place)
             route = route_to(cmap, m.x, m.y, cell)
@@ -356,7 +397,10 @@ class Fetcher:
                 continue
             if ax > at[0]:
                 print(f"  近处停不了，停在离它 {ax:.2f} m 处", flush=True)
+            print(f"  [停靠] 第 {attempt + 1} 个停靠点 ({place[0]:+.2f}, {place[1]:+.2f}) 朝向 {math.degrees(h):+.0f}°，"
+                  f"路线 {[(round(x, 2), round(y, 2)) for x, y in route]}", flush=True)
             result = fast_follow(m, self.head, route, status)
+            print(f"  [停靠] 快走结果 {result}，车 ({m.x:+.2f}, {m.y:+.2f}, {math.degrees(m.yaw):+.0f}°)", flush=True)
             if result == "done" and cr.safe_turn(m, self.head, h, status):
                 return
             print(f"  没开到停靠点 ({place[0]:+.2f}, {place[1]:+.2f})（{result}），按现在的地图换一个", flush=True)
@@ -385,12 +429,17 @@ class Fetcher:
 
     def unhem(self, hemmed, status):
         """After spots missed in a row for want of room to turn here (`hemmed` of them), the next
-        spot would start with the same turn: once, back away HEM_BACK_M (as far as the map behind
-        allows) to get room; after that, give up here. Raises Fail when it cannot."""
+        spot would start with the same turn: once, back out the way it came (cr.retreat, the slides
+        included) until it can turn, or else back away HEM_BACK_M (as far as the map behind allows)
+        to get room; after that, give up here. Raises Fail when it cannot."""
         if hemmed < HEM_TRIES:
             return
         m = self.mover
         if hemmed == HEM_TRIES:
+            # Straight back the map stopped it 0.09 m short of a paper ball behind, which it had slid
+            # in past, and nothing could turn there for 3 minutes (2026-11-07): the way in is free.
+            if cr.retreat(m) >= 0.05:
+                return
             room = cr.map_room(m, math.pi, HEM_BACK_M)
             if room >= 0.05:
                 print(f"  这里转不了身：先往后退 {room:.2f} m 腾出地方", flush=True)
@@ -433,14 +482,20 @@ class Fetcher:
         if not cr.safe_turn(m, self.head, bearing, status):
             print("  转不过去正对它，先这样，靠平移对准", flush=True)
 
-    def slide(self, rel, dist, status, ignore=(), search=False):
+    def slide(self, rel, dist, status, ignore=(), search=False, ignore_r=0.10, map_check=False, map_ignore=None):
         """Move `dist` towards `rel` (rad from the heading), heading kept, slowly. The lidar returns
         near `ignore` (base frame: the thing being approached) do not stop it, any other in the way does.
         search: the map limits the way and the lidar watches while it moves (towards where the map says
-        a thing is that the cameras do not see, or up to a small thing on the floor)."""
+        a thing is that the cameras do not see, or up to a small thing on the floor). map_check: the map
+        limits the way too, the marks within ignore_r of `ignore` aside: the lidar does not see a bottle
+        or a carton lying low, and a slide to the can ran over both (2026-11-07). map_ignore: the mask
+        of map cells to leave aside instead (can_mask)."""
         m = self.mover
-        if search:
-            room = cr.map_room(m, rel, dist)
+        if search or map_check:
+            near = map_ignore
+            if near is None and map_check and ignore:
+                near = m.cmap.mask_of([cr.to_map(m.pose, p) for p in ignore], ignore_r)
+            room = cr.map_room(m, rel, dist, near)
             if room < 0.03:
                 raise Fail(f"朝 {math.degrees(rel):+.0f}° 平移，地图上紧挨着就有东西")
             dist = min(dist, room)
@@ -449,15 +504,16 @@ class Fetcher:
         xy = m.lidar.latest_xy()
         if abs(rel) <= math.radians(100.0) and xy is not None:
             local = [(float(x), float(y)) for x, y in xy
-                     if all(math.hypot(x - a, y - b) > 0.10 for a, b in ignore)]
+                     if all(math.hypot(x - a, y - b) > ignore_r for a, b in ignore)]
             if cr.swept_hit(local, rel, dist, 0.03):
                 raise Fail(f"朝 {math.degrees(rel):+.0f}° 平移 {dist:.2f} m 的路上雷达看到别的东西")
         m.hold = m.yaw
-        moved = m.drive(rel, dist, status, record=False, guard=search, speed=FINE_LIN, count_stuck=False)
+        # Recorded in the trail: unhem backs out along it.
+        moved = m.drive(rel, dist, status, guard=search, speed=FINE_LIN, count_stuck=False)
         if m.stuck:
             print(f"  慢速平移只走了 {moved:.2f} / {dist:.2f} m，加快再推一次", flush=True)
             m.hold = m.yaw
-            again = m.drive(rel, dist - moved, status, record=False, guard=search, speed=KICK_LIN, count_stuck=False)
+            again = m.drive(rel, dist - moved, status, guard=search, speed=KICK_LIN, count_stuck=False)
             if m.stuck:
                 raise Fail(f"朝 {math.degrees(rel):+.0f}° 平移推不动（走了 {moved + again:.2f} / {dist:.2f} m）")
 
@@ -512,13 +568,16 @@ class Fetcher:
             pick.save_run(d, run)
             return d, run, False
         # The fixed jaw's tip stays MIN_TIP_Z_M off the floor: a cap lower than that is taken that high.
-        got["cap"][2] = max(got["cap"][2], pick.MIN_TIP_Z_M + pick.ik.GRASP_INSET + 0.002)
-        run["nudge_mm"] = grasp_nudge_mm(got["axis"])
+        # And no higher than CAP_Z_MAX_M: the jaws then reach down round the whole cap.
+        got["cap"][2] = min(max(got["cap"][2], pick.MIN_TIP_Z_M + pick.ik.GRASP_INSET + 0.002), CAP_Z_MAX_M)
+        crushed = got["radius"] >= CRUSHED_R_M
+        run["nudge_mm"] = grasp_nudge_mm(got["axis"], CRUSHED_ALONG_M if crushed else GRASP_ALONG_M)
         run.update({"cap_axis_base_m": got["cap"].tolist(), "label_base_m": got["mid"].tolist(),
                     "bottle_axis_base": got["axis"].tolist(), "bottle_length_m": got["length"],
-                    "bottle_radius_m": got["radius"], "bottle_cut": got["cut"]})
+                    "bottle_radius_m": got["radius"], "bottle_cut": got["cut"], "bottle_crushed": crushed})
         print(f"  瓶盖 (mm) {np.round(got['cap'] * 1000).astype(int).tolist()}（高度按{got['z_from']}），"
-              f"瓶长 {got['length'] * 100:.0f} cm" + ("，瓶子有一截在画面外" if got["cut"] else ""), flush=True)
+              f"瓶长 {got['length'] * 100:.0f} cm" + ("，瓶子有一截在画面外" if got["cut"] else "")
+              + ("，压瘪的瓶子：夹瓶盖本身" if crushed else ""), flush=True)
         pick.LIFT_HEIGHTS_M = lift_heights(got["length"], got["cut"])
         try:
             run["plan"] = pick.solve_steps(run, self.arm.deg())
@@ -639,6 +698,7 @@ class Fetcher:
             return False
         print(f"  拿起来了：抬起后夹爪仍停在 {g:.1f}°", flush=True)
         pick.park(arm, keep_grip=True)
+        pick.stow(arm)  # over the body, out of the head cameras' view (still squeezed hard meanwhile)
         arm.ease_grip(closed)
         return True
 
@@ -672,23 +732,30 @@ class Fetcher:
         """A small thing (pick_small): beside it (go_near), then slid until it lies at SMALL_AT where
         the grasp view sees it (the map's place was 10 cm off: a scrap ended up 27 cm from the arm's
         base, out of upright reach, 2026-11-05), then aimed with the wrist camera and picked. Returns
-        where it lay (map frame) and how far it hangs below the grasp point."""
+        where it lay (map frame) and how far it hangs below the grasp point. The grasp is planned on
+        the photo that found it in place (no second look); a thing too wide for the jaws, or out of
+        reach where the body cannot get nearer, is not tried again (Fail retry False)."""
         m = self.mover
         centre = self._centre(obj)
         print(f"去捡 {obj['id']} 号{obj['label']} ({centre[0]:+.2f}, {centre[1]:+.2f})", flush=True)
         self.go_near(centre, "去垃圾旁边")
+        if self.became_bottle(obj):
+            return self.fetch_bottle(obj)
         args = argparse.Namespace(model=self.args.model, dx=0.0, dy=0.0)
         for attempt in range(PICK_TRIES):
+            seen, held_short = None, False
             for step in range(SMALL_STEPS):
                 # Where it is: as the grasp view measures it, or as the map has it when not in view.
                 try:
-                    _, seen = pick_small.look(self.args.model, self.rig, expect=cr.to_robot(m.pose, centre),
+                    d, seen = pick_small.look(self.args.model, self.rig, expect=cr.to_robot(m.pose, centre),
                                               plan_it=False)
                     here = np.array(seen["mid_base_m"][:2])
                     centre = cr.to_map(m.pose, here)
+                except pick_small.TooBig as err:
+                    raise Fail(str(err), retry=False)
                 except SystemExit as err:
                     print(f"  {err}", flush=True)
-                    here = np.array(cr.to_robot(m.pose, centre))
+                    seen, here = None, np.array(cr.to_robot(m.pose, centre))
                 move = here - np.array(SMALL_AT)
                 if np.linalg.norm(move) < SMALL_TOL_M:
                     break
@@ -698,14 +765,25 @@ class Fetcher:
                 try:
                     self.slide(math.atan2(move[1], move[0]), float(np.linalg.norm(move)), "靠近垃圾",
                                [tuple(here)], search=True)
+                    seen = None  # moved: that photo is old
                 except Fail as err:
                     print(f"  {err}，就在这里夹", flush=True)
+                    held_short = True
                     break
             self.cool_gripper()
             try:
-                d, run = pick_small.look(self.args.model, self.rig, expect=cr.to_robot(m.pose, centre))
+                if seen is not None:  # the photo that found it where it lies now: plan on it
+                    run = seen
+                    run["plan"] = pick_small.plan(run, self.arm.deg())
+                    pick_small.save(d, run)
+                else:
+                    d, run = pick_small.look(self.args.model, self.rig, expect=cr.to_robot(m.pose, centre))
+            except pick_small.TooBig as err:
+                raise Fail(str(err), retry=False)
             except SystemExit as err:
                 print(f"  {err}", flush=True)
+                if held_short:  # out of reach, and the body cannot get nearer: the same next time
+                    raise Fail(f"够不着，车也靠不过去：{err}", retry=False)
             else:
                 centre = cr.to_map(m.pose, run["mid_base_m"][:2])
                 try:
@@ -720,6 +798,14 @@ class Fetcher:
     def fetch(self, obj):
         return self.fetch_bottle(obj) if self.kind(obj) == "bottle" else self.fetch_small(obj)
 
+    def became_bottle(self, obj):
+        """The looks on the way named the thing a bottle (a scrap merged into one beside it): then it is
+        fetched as one, not given up as a scrap out of reach with the bottle skipped with it (2026-11-07)."""
+        if self.kind(obj) != "bottle" or obj not in self.mover.objects:
+            return False
+        print(f"  {obj['id']} 号看了一路成了{obj['label']}，按瓶子捡", flush=True)
+        return True
+
     # --- the trash can --------------------------------------------------------------------
     def bin_box(self, expect):
         """The head turned to map point `expect`, a photo, and the VLM's box round the can nearest that
@@ -727,12 +813,13 @@ class Fetcher:
         m, head = self.mover, self.head
         e = np.array(cr.to_robot(m.pose, expect))
         bearing = math.degrees(math.atan2(e[1], e[0]))
-        cam = head._look(float(np.clip(-bearing, -40.0, 40.0)), BIN_PITCH)  # neck yaw + is right
+        yaw = float(np.clip(-bearing, -40.0, 40.0))  # neck yaw + is right
+        cam = head._look(yaw, BIN_PITCH)
         left, _ = head._grab_pair()
         ans = ask_json(left, BIN_PROMPT, self.args.model, self.args.timeout_s) or {}
         boxes = []
         for o in ans.get("objects") or []:
-            b = _numbers(o.get("bbox") or o.get("bbox_2d"), 4) if isinstance(o, dict) else None
+            b = _numbers(next((v for k, v in o.items() if str(k).startswith("bbox")), None), 4) if isinstance(o, dict) else None
             if b is not None:
                 boxes.append((_px(b[0], cal.WIDTH), _px(b[1], cal.HEIGHT), _px(b[2], cal.WIDTH), _px(b[3], cal.HEIGHT)))
         if not boxes:
@@ -791,8 +878,12 @@ class Fetcher:
             how = f"框底投到地面（框里雷达只有 {len(wall)} 点）"
         print(f"  量到垃圾桶：中心离车 ({c[0]:.2f}, {c[1]:+.2f}) m，半径 {r * 100:.0f} cm（{how}，"
               f"框的方位 {a1:+.0f}~{a2:+.0f}°）", flush=True)
+        centre = cr.to_map(m.pose, c)
+        off = math.hypot(centre[0] - expect[0], centre[1] - expect[1])
+        if off > BIN_VS_MAP_M:
+            raise Fail(f"量到的垃圾桶离地图上的桶 {off:.2f} m，不是同一个")
         self.bin_photo = got
-        return cr.to_map(m.pose, c), float(r)
+        return centre, float(r)
 
     def measure_rim(self, centre, r):
         """Rim height (m) of the can at `centre` (map frame): the top of its box (the far rim, the
@@ -834,13 +925,24 @@ class Fetcher:
         self.bin_at = (centre, r, rim)
         self.head.neck = None
 
-    def reach_bin(self, where, status):
+    def reach_bin(self, where, status, drop=None):
         """Beside the can at map point `where`, facing it: go_stage with it at BIN_AT (or a little
         further), else any spot NEAR_M from it (the drop's slides then bring it into place). Carrying a
         paper ball, no stage was left round a can in clutter after a long pick beside it, and the run
-        stopped with the ball in the jaws (2026-11-05)."""
+        stopped with the ball in the jaws (2026-11-05). drop (radius, rim, hang): carrying something to
+        drop, a spot from which the body slides straight to a drop place (drop_goal) comes first: three
+        times the same spot was taken beside a milk carton that blocked every slide (2026-11-07)."""
+        at = BIN_AT
+
+        def drops_from(place, h, ax):
+            try:
+                self.drop_goal((ax, at[1]), *drop, pose=(place[0], place[1], h), quiet=True)
+                return True
+            except Fail:
+                return False
+
         try:
-            self.go_stage(where, BIN_AT, None, status)
+            self.go_stage(where, at, None, status, None if drop is None else drops_from)
             return
         except Fail as err:
             print(f"  {err}：改去离桶 {NEAR_M[0]}-{NEAR_M[1]} m 的任意能到的地方", flush=True)
@@ -880,28 +982,57 @@ class Fetcher:
         return out
 
     def to_bin(self, hang, check_held=True):
-        """Into the can; False when the bottle was lost on the way (check_held: a bottle's cap keeps
-        the jaws apart; a paper scrap lets them close nearly all the way, so for it there is no check)."""
+        """Into the can, carried stowed (pick.stow: over the body, out of the cameras' view); False when
+        the bottle was lost on the way (check_held: a bottle's cap keeps the jaws apart; a paper scrap
+        lets them close nearly all the way, so for it there is no check). What hung from the body before
+        and after is gone from its place (body_changed)."""
+        pick.stow(self.arm)
+        cr.body_changed(self.mover)
+        try:
+            return self._to_bin(hang, check_held)
+        finally:
+            cr.body_changed(self.mover)
+
+    def _to_bin(self, hang, check_held):
         m = self.mover
         where, _, rim = self.bin_at
         print(f"拿着它去垃圾桶，桶口离地 {rim:.2f} m", flush=True)
         for attempt in range(BIN_TRIES):
             try:
-                self.reach_bin(where, "拿着垃圾去垃圾桶")
+                self.reach_bin(where, "拿着垃圾去垃圾桶", (self.bin_at[1], rim, hang))
                 centre, r = self.measure_bin(where)
+                # The next spot is picked round the can as measured: picked round the map's can, 0.3 m
+                # off, the can stood right of the body instead of left, twice (2026-11-07).
+                where = centre
+                self.bin_at = (centre, self.bin_at[1], rim)
+                goal, legs = self.drop_goal(cr.to_robot(m.pose, centre), r, rim, hang)
+                near = self.can_mask(centre, r)
+                for v in legs[:-1]:  # round what is in the way; the last leg is the straight way below
+                    self.slide(math.atan2(v[1], v[0]), float(np.linalg.norm(v)), "绕开东西靠近垃圾桶",
+                               [cr.to_robot(m.pose, centre)], ignore_r=r + 0.05, map_check=True, map_ignore=near)
+                for _ in range(3):
+                    c = cr.to_robot(m.pose, centre)
+                    move = np.array(c) - goal
+                    if np.linalg.norm(move) < BIN_TOL_M:
+                        break
+                    # The can's own wall (r from its centre) is not in the way: the slide ends just short of it.
+                    try:
+                        self.slide(math.atan2(move[1], move[0]), float(np.linalg.norm(move)), "靠近垃圾桶", [c],
+                                   ignore_r=r + 0.05, map_check=True, map_ignore=near)
+                    except Fail as err:
+                        # Short of the place the arm may reach the can all the same: the last few cm were
+                        # blocked by a milk carton beside the body and the can was given up (2026-11-07).
+                        if not self.drop_reaches(np.array(cr.to_robot(m.pose, centre)), r, rim, hang):
+                            raise
+                        print(f"  {err}：在这里手臂也够得着桶口，就在这里扔", flush=True)
+                        break
                 break
             except Fail as err:
                 print(f"  到不了垃圾桶边（第 {attempt + 1} 次）：{err}", flush=True)
                 if attempt + 1 == BIN_TRIES or not self.elsewhere(where):
                     raise
-        goal = (BUMPER_X + r + BIN_GAP_M, BIN_Y)
-        for _ in range(3):
-            c = cr.to_robot(m.pose, centre)
-            move = np.array(c) - goal
-            if np.linalg.norm(move) < BIN_TOL_M:
-                break
-            self.slide(math.atan2(move[1], move[0]), float(np.linalg.norm(move)), "靠近垃圾桶", [c])
         c = cr.to_robot(m.pose, centre)
+        pick.unstow(self.arm)  # back at PARK, where the drop starts
         # Squeeze hard again for the swing out over the can; a jaw that closes right up holds nothing.
         closed = self.arm.limits["gripper"][0]
         g = self.arm.grip(closed)
@@ -911,7 +1042,8 @@ class Fetcher:
             return False
         m.show("扔进垃圾桶")
         try:
-            arm_drop.drop(self.arm, c, r, rim, hang)
+            # A bottle hangs and swings: CARRY speed; a small thing in the jaws does not.
+            arm_drop.drop(self.arm, c, r, rim, hang, speed=None if check_held else pick.PARK_DEG_S)
         except SystemExit as err:
             raise Fail(str(err))
         print(f"  扔进去了（桶边照片 {self.drop_photo(centre)}）", flush=True)
@@ -936,7 +1068,7 @@ class Fetcher:
         to do. Each goes into the ledger first, and its result after."""
         did = False
         self.later, self.second_go = [], False
-        self.mover.follow_near_only = True  # the map is built: one near look per step on the way
+        self.mover.follow_no_look = True  # the map is built: on the way the lidar and the map do
         self.count()
         while True:
             can = self.bin()
@@ -963,11 +1095,15 @@ class Fetcher:
             except Fail as err:
                 print(f"  这个先不捡了，先捡别的：{err}", flush=True)
                 self.settle(c0, f"没捡成（{err}）")
-                self.later.append(c0)
+                if err.retry:  # worth one more go at the end of the round
+                    self.later.append(c0)
                 self.end_fetch()
+                self.drop_left_over(obj)
                 continue
             self.skip.append(where)
-            self.forget(where)
+            # A bottle is as long as it hangs: its marks reach that far from its middle, not 12.5 cm
+            # (an 18 cm one left marks that refused the turns on the way to the can, 2026-11-06).
+            self.forget(where, max(SKIP_NEAR_M / 2, hang))
             if self.args.no_bin:
                 self.done += 1
                 self.settle(c0, "捡起来了（没扔）")
@@ -983,17 +1119,104 @@ class Fetcher:
                 raise SystemExit(f"垃圾拿在手里，但扔不进垃圾桶：{err}")
             self.end_fetch()
 
+    def drop_goal(self, c, r, rim, hang, pose=None, quiet=False):
+        """Where the can (at base-frame c, radius r, seen from `pose`, the body's now by default) should
+        come for the drop, and the way there: [(goal, legs)], legs the slides (base frame at the start)
+        that get it there. BIN_GAP_M ahead of the bumper and BIN_Y to the left, or the nearest place
+        round that the body slides to without crossing anything on the map, straight or else along
+        and then across (or the other way round), and from which the arm still reaches over the can. A
+        milk carton beside the can lay on the way straight to the usual place; the run stopped there
+        with a paper ball in the jaws (2026-11-07). Raises Fail, saying what was in the way, when there
+        is none."""
+        m = self.mover
+        pose = m.pose if pose is None else pose
+        home = np.array([BUMPER_X + r + BIN_GAP_M, BIN_Y])
+        goals = sorted((home + (dx, dy) for dx in DROP_SHIFT_X_M for dy in DROP_SHIFT_Y_M),
+                       key=lambda g: float(np.linalg.norm(g - home)))
+        near = self.can_mask(cr.to_map(pose, c), r)
+        blockers, far = set(), 0
+        for g in goals:
+            move = np.array(c) - g
+            ways = [[move]]
+            if abs(move[0]) >= BIN_TOL_M and abs(move[1]) >= BIN_TOL_M:
+                ways += [[np.array([move[0], 0.0]), np.array([0.0, move[1]])],
+                         [np.array([0.0, move[1]]), np.array([move[0], 0.0])]]
+            legs = next((w for w in ways if self._slides_free(pose, w, near, blockers)), None)
+            if legs is None:
+                continue
+            if not self.drop_reaches(g, r, rim, hang):
+                far += 1
+                continue
+            if not quiet and (g is not goals[0] or len(legs) > 1):
+                print(f"  直着平移过去的路上地图有东西：改让桶停在车前 ({g[0]:.2f}, {g[1]:+.2f}) m"
+                      + ("，先" + "、再".join(f"朝 {math.degrees(math.atan2(v[1], v[0])):+.0f}° 平移 {np.linalg.norm(v):.2f} m"
+                                             for v in legs) if len(legs) > 1 else ""), flush=True)
+            return g, legs
+        why = "、".join(sorted(blockers)) or "地图上的障碍"
+        raise Fail(f"垃圾桶边没有能平移过去、手臂又够得着桶口的位置（路上挡着：{why}"
+                   + (f"；{far} 个路通的位置手臂够不着" if far else "") + "）")
+
+    def can_mask(self, at, r):
+        """Map cells of the can at map point `at` (radius r), not in the way of the body going up to it:
+        round where it was measured, and the map's other models of it nearby (one can is often several,
+        a few cm to 20 cm apart). drop_goal and the slides use the same: the slides alone left those
+        models in and stopped where drop_goal had found the way clear, twice (2026-11-07)."""
+        m = self.mover
+        near = m.cmap.mask_of([at], r + 0.05)
+        for o in m.objects:
+            if is_bin(o["label"]) and math.hypot(*np.subtract(self._centre(o), at)) <= BIN_VS_MAP_M:
+                near |= m.cmap.mask_of(o["points"], 0.03)
+        return near
+
+    def _slides_free(self, pose, legs, near, blockers):
+        """The slides `legs` (base frame at pose, one after the other, heading kept) cross nothing on the
+        map but the mask `near`. Adds the names of what is in the way to `blockers`."""
+        m, cmap = self.mover, self.mover.cmap
+        x, y, yaw = pose
+        for v in legs:
+            dist = float(np.linalg.norm(v))
+            if dist < BIN_TOL_M:
+                continue
+            rel = math.atan2(v[1], v[0])
+            body = types.SimpleNamespace(cmap=cmap, pose=(x, y, yaw), x=x, y=y, yaw=yaw)
+            room = cr.map_room(body, rel, dist, near)
+            if room < dist - 0.01:
+                a = yaw + rel
+                d = min(dist, room + 0.03)
+                hit = cmap.body_mask(x + d * math.cos(a), y + d * math.sin(a), yaw, margin=0.06)  # the marks round a thing
+                for o in m.objects:
+                    if o.get("trash") and cr.passable(o["label"], o.get("height")):
+                        continue  # driven over: not what stops it
+                    if not is_bin(o["label"]) and any(
+                            (cell := cmap.world_to_cell(px, py)) is not None and hit[cell] for px, py in o["points"]):
+                        blockers.add(o["label"])
+                return False
+            x, y = x + dist * math.cos(yaw + rel), y + dist * math.sin(yaw + rel)
+        return True
+
+    def drop_reaches(self, g, r, rim, hang):
+        """The arm reaches over a can at base-frame g from PARK (arm_drop.plan_drop, remembered: the
+        stages round a can all ask about the same few places)."""
+        key = (round(float(g[0]), 3), round(float(g[1]), 3), round(r, 3), round(rim, 3), round(hang, 3))
+        if key not in self.drop_cache:
+            try:
+                arm_drop.plan_drop(pick.PARK, tuple(g), r, rim, hang)
+                self.drop_cache[key] = True
+            except SystemExit:
+                self.drop_cache[key] = False
+        return self.drop_cache[key]
+
     def drop_held(self, hang):
         """The bottle the gripper already holds (a run that stopped) into the can, before anything
         else; then the head learns its body again without the bottle hanging in view."""
         can = self.bin()
         if can is None:
             raise SystemExit("左臂上夹着瓶子，但地图上没有垃圾桶")
-        self.survey_bin(can)
+        self.survey_bin(can)  # stowed since the start (work)
         try:
             # A small thing (short hang) lets the jaws close nearly all the way: no held check.
-            if self.to_bin(hang, check_held=hang >= MIN_HANG_M):
-                self.done += 1
+            # Not counted in --max-items: that many are still picked up after it (the user, 2026-11-07).
+            self.held_dropped = self.to_bin(hang, check_held=hang >= MIN_HANG_M)
         except Fail as err:
             raise SystemExit(f"瓶子拿在手里，但扔不进垃圾桶：{err}")
         self.end_fetch()
@@ -1002,25 +1225,48 @@ class Fetcher:
         else:
             print("  转身半径内有东西，不重新认车身（画面左下角瓶子挂过的地方还当车身）", flush=True)
 
+    def drop_left_over(self, obj):
+        """After a fetch given up: a thing still in the jaws (jaws_hold) goes into the can first, carried
+        as such; not known to be carried, the cameras take it for something in the way."""
+        if not jaws_hold(self.arm):
+            return
+        print(f"  夹爪收臂后停在 {self.arm.deg()['gripper']:.1f}°（空着是 {pick.PARK['gripper']:.0f}°）："
+              "手里还夹着东西，先扔进垃圾桶", flush=True)
+        if self.bin_at is None:
+            raise SystemExit("手里夹着东西，没量过垃圾桶，扔不了：停下")
+        bottle = self.kind(obj) == "bottle"
+        self.arm.ease_grip(self.arm.limits["gripper"][0])
+        try:
+            self.to_bin(HANG_CUT_M if bottle else SMALL_HANG_M, check_held=bottle)
+        except Fail as err:
+            raise SystemExit(f"垃圾拿在手里，但扔不进垃圾桶：{err}")
+        self.end_fetch()
+
     def end_fetch(self):
         try:
             pick.park(self.arm)  # nothing in hand here; does nothing when already parked
         except SystemExit as err:
             raise SystemExit(f"左臂收不回来：{err}")
+        cr.body_changed(self.mover)
         self.head.neck = None
         self.mover.cmap.rebuild()
 
-    def forget(self, where):
+    def forget(self, where, reach=SKIP_NEAR_M / 2):
         """The bottle that lay at `where` (map frame) is in the gripper: whatever the map modelled
-        there and its marks go. Looks on the way there may have merged it into another model, so it
-        is found by place, not by the model the fetch started from."""
+        within `reach` of there and its marks go. Looks on the way there may have merged it into
+        another model, so it is found by place, not by the model the fetch started from."""
         m, cmap = self.mover, self.mover.cmap
-        cmap.clear_vis(cmap.mask_of([where], SKIP_NEAR_M / 2))
+        cmap.clear_vis(cmap.mask_of([where], reach))
         m.objects = [o for o in m.objects
                      if o.get("size", o["length"]) > BOTTLE_MAX_M
-                     or math.hypot(*(np.subtract(self._centre(o), where))) > SKIP_NEAR_M / 2]
+                     or math.hypot(*(np.subtract(self._centre(o), where))) > reach]
         cmap.rebuild()
         cr.show_objects(m)
+
+
+def jaws_hold(arm):
+    """The arm parked, its jaws stopped short of PARK's (HELD_DEG): something is in them."""
+    return arm.deg()["gripper"] > pick.PARK["gripper"] + HELD_DEG
 
 
 def forget_movable(mover):
@@ -1041,22 +1287,34 @@ def forget_movable(mover):
 def fast_follow(mover, head, route, status):
     """coverage_run.follow on a known map without the looks: turn to each leg (when nothing is inside the
     turning circle), then straight on in FAST_STEP_M steps as far as the lidar and the map leave room,
-    the lidar watching while it drives. Where that cannot go on, the rest is coverage_run.follow."""
+    the lidar watching while it drives; the last FAST_SLIDE_M to a corner slid, without a turn. After a
+    turn the way is worked out again from where the lidar puts the body. Where that cannot go on, the
+    rest is coverage_run.follow."""
     for i, (tx, ty) in enumerate(route[1:], start=1):
         for _ in range(100):
             d = math.hypot(tx - mover.x, ty - mover.y)
-            if d < 0.04:
+            if d < FAST_ARRIVE_M:
                 break
             heading = math.atan2(ty - mover.y, tx - mover.x)
-            if abs(cr.wrap_deg(math.degrees(heading - mover.yaw))) > FAST_TURN_TOL_DEG:
+            off = cr.wrap_deg(math.degrees(heading - mover.yaw))
+            print(f"  [快走] 第 {i}/{len(route) - 1} 段 目标 ({tx:+.2f}, {ty:+.2f}) 车 ({mover.x:+.2f}, {mover.y:+.2f}, "
+                  f"{math.degrees(mover.yaw):+.0f}°) 离 {d:.2f} m 朝向差 {off:+.0f}°", flush=True)
+            if d <= FAST_SLIDE_M and cr.map_room(mover, math.radians(off), d) >= d - FAST_ARRIVE_M:
+                print(f"  [快走] 不转身，朝 {off:+.0f}° 平移 {d:.2f} m", flush=True)
+                mover.hold = mover.yaw
+                mover.drive(math.radians(off), d, status)
+            elif abs(off) > FAST_TURN_TOL_DEG:
                 if cr.turn_blocker(mover) is not None:
                     return cr.follow(mover, head, [(mover.x, mover.y)] + list(route[i:]), status)
                 mover.turn_to(heading, status)
-            step = min(FAST_STEP_M, d, cr.free_ahead(mover, [], 0.0, FAST_STEP_M))
-            if step < 0.05:
-                return cr.follow(mover, head, [(mover.x, mover.y)] + list(route[i:]), status)
-            mover.hold = heading
-            mover.drive(0.0, step, status, speed=FAST_LIN)
+                continue  # the turn moved the body: the way again, from where the lidar put it
+            else:
+                step = min(FAST_STEP_M, d, cr.free_ahead(mover, [], 0.0, FAST_STEP_M))
+                print(f"  [快走] 往前 {step:.2f} m", flush=True)
+                if step < 0.05:
+                    return cr.follow(mover, head, [(mover.x, mover.y)] + list(route[i:]), status)
+                mover.hold = heading
+                mover.drive(0.0, step, status, speed=FAST_LIN)
             if mover.stuck:
                 return cr.follow(mover, head, [(mover.x, mover.y)] + list(route[i:]), status)
             cell = mover.cmap.world_to_cell(tx, ty)
@@ -1079,18 +1337,21 @@ def quick_survey(mover, head, status):
             break
         mover.turn_by(360.0 / QUICK_STOPS, status)
     mover.survey_at = (mover.x, mover.y)
+    mover.surveyed = getattr(mover, "surveyed", []) + [mover.survey_at]
 
 
-def viewpoints(cmap, x, y):
+def viewpoints(cmap, x, y, seen_from=()):
     """Places (map cells) the body can reach from which all open floor lies within VIEW_R_M of one,
-    the one showing the most new floor first, nearest by road among near-equals."""
+    the one showing the most new floor first, nearest by road among near-equals. The floor round
+    (x, y) and round the places in `seen_from` (looked round from already) is left out: right after the
+    look round at the can, the first viewpoint was beside the can again (2026-11-07)."""
     k = max(1, int(round(cr.OPEN_FLOOR_M / cmap.res)))
     free = cmap.seen & ~cmap.occupied()
     todo = cv2.morphologyEx(free.astype(np.uint8), cv2.MORPH_OPEN, np.ones((k, k), np.uint8)) > 0
     dist = drive_dist(cmap, x, y)
     reach = dist >= 0
     kern = disk(VIEW_R_M / cmap.res).astype(np.float32)
-    todo &= ~(cv2.dilate(cmap.mask_of([(x, y)], 0.0).astype(np.uint8), kern.astype(np.uint8)) > 0)
+    todo &= ~(cv2.dilate(cmap.mask_of([(x, y)] + list(seen_from), 0.0).astype(np.uint8), kern.astype(np.uint8)) > 0)
     out = []
     while len(out) < VIEW_MAX:
         gain = cv2.filter2D(todo.astype(np.float32), -1, kern, borderType=cv2.BORDER_CONSTANT)
@@ -1106,11 +1367,12 @@ def viewpoints(cmap, x, y):
     return out
 
 
-def rescan(mover, head):
+def rescan(mover, head, after=None):
     """What lies on the floor now, on a known map: a quick look round here, then to the viewpoints
-    (nearest by road next) driving on the map and the lidar, a quick look round at each."""
+    (nearest by road next) driving on the map and the lidar, a quick look round at each. after(): called
+    after each of those looks (fetch what it found); True stops the round."""
     cmap = mover.cmap
-    places = viewpoints(cmap, mover.x, mover.y)
+    places = viewpoints(cmap, mover.x, mover.y, getattr(mover, "surveyed", []))
     print(f"重新巡视：除了这里还有 {len(places)} 个观察点（每个点周围 {VIEW_R_M} m 的地面都看得到）", flush=True)
     tries = {}
     while places:
@@ -1129,7 +1391,30 @@ def rescan(mover, head):
                 places.append(cell)
             continue
         quick_survey(mover, head, "重新巡视：低头看一圈找垃圾")
+        if after is not None and after():
+            print("扔够了，不再巡视", flush=True)
+            return
     print("重新巡视完了", flush=True)
+
+
+def rear_check(lidar):
+    """What the lidar returns beyond its VIEW_DEG, per 20 deg: with the side poles off the body
+    (2026-11-06) it may see further round than the 100 deg it was cut to."""
+    for _ in range(30):
+        raw = lidar.latest_raw()
+        if raw is not None:
+            break
+        time.sleep(0.1)
+    else:
+        return
+    a = (raw[:, 0] + 180.0) % 360.0 - 180.0  # clockwise from the nose: + is right
+    parts = []
+    for lo in range(100, 180, 20):
+        for sign, side in ((1, "右"), (-1, "左")):
+            sel = (sign * a >= lo) & (sign * a < lo + 20)
+            if sel.any():
+                parts.append(f"{side}{lo}-{lo + 20}° {int(sel.sum())} 点 最近 {raw[sel, 1].min():.2f} m")
+    print("  [雷达后方] " + ("；".join(parts) if parts else "100° 以外没有回波"), flush=True)
 
 
 def work(args, view, robot):
@@ -1149,8 +1434,17 @@ def work(args, view, robot):
         arm.enable()
         arm.ease_grip(arm.limits["gripper"][0])
         pick.park(arm, keep_grip=True)
+        pick.stow(arm)  # over the body while it goes to the can
     else:
         pick.park(arm)  # out of the floor in front, and where the grasp view's mask expects it
+        if jaws_hold(arm):
+            # Left in the jaws by an earlier run: carried like --holding, as long as a bottle partly
+            # out of view (its length is not known), into the can first.
+            print(f"夹爪收臂后停在 {arm.deg()['gripper']:.1f}°（空着是 {pick.PARK['gripper']:.0f}°）：手里还夹着东西，"
+                  f"按 --holding {HANG_CUT_M:.2f} 处理，先扔进垃圾桶", flush=True)
+            args.holding = HANG_CUT_M
+            arm.ease_grip(arm.limits["gripper"][0])
+            pick.stow(arm)
     try:
         imu = Imu(args.imu_port)
     except RuntimeError as err:
@@ -1160,6 +1454,7 @@ def work(args, view, robot):
     robot["lidar"] = lidar
     try:
         lidar.start()
+        rear_check(lidar)
     except Exception as err:
         raise SystemExit(f"雷达没打开：{err}。检查雷达 USB 和电机；定位靠雷达，没有雷达不能跑")
     head.lidar_xy = lidar.latest_xy
@@ -1177,14 +1472,23 @@ def work(args, view, robot):
         xy = lidar.latest_xy()
         near = [] if xy is None else [math.hypot(float(x), float(y)) for x, y in xy
                                       if math.hypot(float(x), float(y)) <= cr.BODY_CLEARANCE_M + cr.TURN_SPARE]
-        if near:
-            raise SystemExit(f"转身半径内有东西（离车 {min(near):.2f} m）：把车挪到四周 0.4 m 内没东西的地方再定位")
         forget_movable(mover)
         mover.attach_imu()
+        if near:
+            # Off the map yet: make_turn_room slides by the lidar alone (the map has no cells out there).
+            print(f"  转身半径内有东西（离车 {min(near):.2f} m），先按雷达平移到能转身的地方再定位", flush=True)
+            if not cr.make_turn_room(mover):
+                raise SystemExit(f"转身半径内有东西（离车 {min(near):.2f} m），雷达看得到的方向也挪不开："
+                                 "把车挪到四周 0.4 m 内没东西的地方再定位")
         cr.learn_self(mover, head)
         saved_map.relocate(mover)
         mover.set_stage("explore")
-        quick_survey(mover, head, "定位好了：低头看一圈找垃圾")
+        # Holding something, straight to the can (it is on the map) and the look round after: six stops
+        # of looks before the drop, with the floor round it open, looked like dithering (the user,
+        # 2026-11-07).
+        if not args.holding:
+            quick_survey(mover, head, "定位好了：低头看一圈找垃圾")
+        mover.follow_no_look = True  # on the known map the lidar and the map keep the way, no looks
     else:
         mover.attach_imu()
         cr.warm_up(mover, head)
@@ -1192,14 +1496,34 @@ def work(args, view, robot):
     if args.holding:
         print(f"--holding：先把左臂上的瓶子（长 {args.holding * 100:.0f} cm）扔进垃圾桶")
         fetch.drop_held(args.holding)
+        if args.use_map:
+            mover.set_stage("explore")
+            quick_survey(mover, head, "扔完了：低头看一圈找垃圾")
     if args.rescan:
-        print("--rescan：在已有地图上去几个观察点低头看，找现在的瓶子")
-        rescan(mover, head)
+        # Fetched as found (user, 2026-11-07): what the look after locating saw first, then at each
+        # viewpoint what its look saw, rather than every viewpoint first and the fetching after.
+        print("--rescan：定位后先捡看到的垃圾，再去下一个观察点看、捡")
+        if fetch.bin() is None and not args.no_bin:
+            msg = "地图上没有垃圾桶：一个也不捡（只想捡起来试试用 --no-bin）"
+            mover.show(msg)
+            print(msg)
+            return
+
+        def fetch_seen():
+            if fetch.targets():
+                mover.set_stage("explore")
+                fetch.run()
+                fetch.print_ledger("看到的捡完")
+            return bool(args.max_items and fetch.done >= args.max_items)
+
+        if not fetch_seen():
+            rescan(mover, head, after=fetch_seen)
     elif args.no_explore:
         print("--no-explore：不探索，去捡已经看到的瓶子")
     else:
         print("探索：深度优先，把能到的地方都走完，再去捡瓶子")
         cr.explore(mover, head)
+    mover.follow_no_look = True  # the map is built: from here on the lidar and the map keep the way
     # Only the whole map says whether there is a trash can at all.
     fetch.count()
     fetch.print_ledger("地图上的垃圾")
@@ -1224,6 +1548,8 @@ def work(args, view, robot):
             fetch.run()
         fetch.print_ledger("巡视完")
     msg = f"扔进垃圾桶 {fetch.done} 个" if not args.no_bin else f"捡起 {fetch.done} 个"
+    if fetch.held_dropped:
+        msg += "（另外开始时夹着的那个也扔进去了）"
     mover.show(msg)
     print(msg)
 
@@ -1238,6 +1564,7 @@ def main():
     p.add_argument("--bin-height", type=float, default=None, help="垃圾桶口离地高度 (m)，默认从垃圾桶的框量")
     p.add_argument("--bin-diameter", type=float, default=None, help="垃圾桶口直径 (m)，默认按 0.24 m 算")
     p.add_argument("--max-items", type=int, default=0, help="扔够这么多个就停，0 = 不限")
+    p.add_argument("--only", choices=("bottle", "small"), default=None, help="只捡瓶子（bottle）或只捡小件（small）")
     p.add_argument("--patrol", type=float, default=0.0, metavar="MIN",
                    help="捡完后每隔这么多分钟巡视一圈，看到新扔的垃圾就去捡（0 = 不巡视）")
     p.add_argument("--no-explore", action="store_true", help="建完图不探索，只去捡建图时看到的垃圾")

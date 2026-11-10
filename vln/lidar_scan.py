@@ -49,6 +49,7 @@ class Lidar:
         self.port = port or find_port()
         self._lock = threading.Lock()
         self._xy = None
+        self._raw = None  # the newest full turn as it came (angle deg, range m), for checking VIEW_DEG
         self._stamp = 0.0
         self._stop = False
         self._thread = None
@@ -163,7 +164,14 @@ class Lidar:
                 pass
             link.close()
 
+    def latest_raw(self):
+        """Nx2 (angle deg clockwise from the nose, range m) of the newest turn, all round, or None."""
+        with self._lock:
+            return None if self._raw is None else self._raw.copy()
+
     def _store(self, scan):
+        with self._lock:
+            self._raw = np.asarray(scan, float)
         # The angle increases clockwise and 0 is the nose. Flip it so y is left.
         ang = -np.deg2rad(scan[:, 0])
         front = np.abs(np.arctan2(np.sin(ang), np.cos(ang))) <= np.deg2rad(VIEW_DEG)

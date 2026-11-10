@@ -15,7 +15,7 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 sys.path[:0] = [str(HERE.parent), str(ROOT / "project_tool")]
-from save_pose import ARMS, FULL_TURN, MOTORS, POSITION_MODE, Servos, degrees, load_calibration  # noqa: E402
+from save_pose import ARMS, FULL_TURN, MOTORS, POSITION_MODE, Servos, degrees, load_calibration, load_range  # noqa: E402
 
 SPEED_DEG = 50.0  # peak joint speed of a move through free space, deg/s
 GRIP_SPEED_DEG = 30.0
@@ -30,12 +30,13 @@ LIMIT_MARGIN_DEG = 3.0  # stay this far inside the calibrated range
 STALL_LAG_TICKS = 50
 STALL_CYCLES = 8
 SQUEEZE_TICKS = 100  # ~9 deg: the servo pushes with what its torque limit allows (25 held bottles loosely)
-# LeRobot leaves the gripper at 50 % torque, current protection 250 and Overload_Torque 25 (so_follower.py):
-# a cap held for Protection_Time (2 s) counts as an overload and the jaw drops to 20 % torque, and the
-# bottle slips out on the way (2026-11-04). On first torque-on the gripper gets the other joints'
-# protection instead. These are EEPROM values: they stay until LeRobot configures the arm again.
-GRIP_EEPROM = {"Max_Torque_Limit": (16, 2, 1000), "Protection_Current": (28, 2, 500), "Overload_Torque": (36, 1, 80)}
-GRIP_TORQUE_LIMIT = (48, 1000)  # RAM Torque_Limit, loaded from Max_Torque_Limit only at power-up
+# The gripper's strength, as LeRobot leaves it (so_follower.py) and the right arm's gripper has it: 50 %
+# torque, current protection 250, Overload_Torque 25 (user, 2026-11-07: it was too strong). From
+# 2026-11-04 it had 1000 / 500 / 80, after a cap held for Protection_Time (2 s) counted as an overload,
+# the jaw dropped to 20 % torque and the bottle slipped out on the way; the jaws have rubber strips
+# since 2026-11-07. Written on torque-on where the EEPROM differs.
+GRIP_EEPROM = {"Max_Torque_Limit": (16, 2, 500), "Protection_Current": (28, 2, 250), "Overload_Torque": (36, 1, 25)}
+GRIP_TORQUE_LIMIT = (48, 500)  # RAM Torque_Limit, loaded from Max_Torque_Limit only at power-up
 # Squeezed SQUEEZE_TICKS past the cap the jaw draws ~325 mA (36 % load) for as long as it holds: carried
 # 13 min to the can it reached its 70 C limit, unloaded and did not open over the can (2026-11-04).
 # Carrying it is eased to HOLD_TICKS past where it stopped: ~70 mA, 16 % load. Held at 60 ticks (~130 mA)
@@ -45,10 +46,16 @@ TEMP_ADDR, STATUS_ADDR = 63, 65  # Present_Temperature (C), Status (bit 2: too h
 
 
 def joint_limits(cal=None):
-    """joint -> (lo, hi) LeRobot degrees, LIMIT_MARGIN_DEG inside the calibrated range."""
+    """joint -> (lo, hi) LeRobot degrees, LIMIT_MARGIN_DEG inside the range the arm may use
+    (save_pose.load_range: the calibrated one, widened where the body no longer stops it, e.g. the
+    shoulder turning out to -117 deg once the side tubes were sawn off, 2026-11-10)."""
     cal = cal or load_calibration("left")
-    return {n: (degrees(cal[n]["range_min"], cal[n]) + LIMIT_MARGIN_DEG,
-                degrees(cal[n]["range_max"], cal[n]) - LIMIT_MARGIN_DEG) for n in MOTORS}
+    usable = load_range("left")
+    return {n: (degrees(usable[n][0], cal[n]) + LIMIT_MARGIN_DEG,
+                degrees(usable[n][1], cal[n]) - LIMIT_MARGIN_DEG) for n in MOTORS}
+
+
+READ_TRIES = 3  # a position read is tried this often before the arm counts as not answering
 
 
 class LeftArm:
@@ -73,6 +80,13 @@ class LeftArm:
 
     def ticks(self):
         out = {n: self.bus.read(i, "Present_Position") for n, i in self.ids.items()}
+        # A servo that missed one reply is asked again: the wrist and gripper each missed one while the
+        # arm moved and the run ended with the arm over a scrap (2026-11-07, twice in 10 min).
+        for _ in range(READ_TRIES - 1):
+            if None not in out.values():
+                break
+            time.sleep(0.02)
+            out.update({n: self.bus.read(self.ids[n], "Present_Position") for n, v in out.items() if v is None})
         if None in out.values():
             raise RuntimeError(f"左臂没有读全: {out}")
         return out
@@ -158,6 +172,37 @@ class LeftArm:
                     break
                 time.sleep(1.0 / CONTROL_HZ)
             self._settle(goal)
+        except KeyboardInterrupt:
+            self.hold()
+            raise
+        return self.deg()
+
+    def move_path(self, path, speed_deg=SPEED_DEG):
+        """Through the joint targets in `path` (dicts of the same joints) without stopping at the ones
+        between: straight in joint space from each to the next, one cosine speed profile over the whole
+        way peaking at speed_deg. Moved one move() per waypoint, the arm stopped at every one and the
+        drop over the can went in jerks (user, 2026-11-07). Ctrl-C stops and holds."""
+        names = list(path[0])
+        self.enable()
+        start = self.ticks()
+        pts = [np.array([start[n] for n in names], float)]
+        pts += [np.array([self.to_ticks(n, q[n]) for n in names], float) for q in path]
+        seg = [float(np.max(np.abs(b - a))) for a, b in zip(pts, pts[1:])]
+        cum = np.concatenate([[0.0], np.cumsum(seg)])
+        duration = cum[-1] * 360.0 / FULL_TURN * np.pi / 2 / speed_deg
+        try:
+            t0 = time.monotonic()
+            while True:
+                tau = min(1.0, (time.monotonic() - t0) / duration) if duration > 0 else 1.0
+                s = (0.5 - 0.5 * np.cos(np.pi * tau)) * cum[-1]
+                k = min(int(np.searchsorted(cum, s, side="right")) - 1, len(seg) - 1)
+                p = pts[k] + (pts[k + 1] - pts[k]) * ((s - cum[k]) / seg[k] if seg[k] > 0 else 1.0)
+                for n, v in zip(names, p):
+                    self.bus.write(self.ids[n], "Goal_Position", int(round(v)))
+                if tau >= 1.0:
+                    break
+                time.sleep(1.0 / CONTROL_HZ)
+            self._settle({n: int(round(v)) for n, v in zip(names, pts[-1])})
         except KeyboardInterrupt:
             self.hold()
             raise

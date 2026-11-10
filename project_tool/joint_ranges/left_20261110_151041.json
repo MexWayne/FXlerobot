@@ -1,0 +1,104 @@
+{
+  "arm": "left",
+  "port": "/dev/arm_B_follower",
+  "time": "2026-11-10T15:10:41",
+  "seconds": 300.0,
+  "joints": {
+    "shoulder_pan": {
+      "recorded_ticks": [
+        748,
+        3162
+      ],
+      "recorded_deg": [
+        -117.4,
+        94.9
+      ],
+      "calibrated_ticks": [
+        1036,
+        3130
+      ],
+      "centred_ticks": [
+        1004,
+        3162
+      ]
+    },
+    "shoulder_lift": {
+      "recorded_ticks": [
+        741,
+        3154
+      ],
+      "recorded_deg": [
+        -106.5,
+        105.6
+      ],
+      "calibrated_ticks": [
+        783,
+        3122
+      ],
+      "centred_ticks": [
+        751,
+        3154
+      ]
+    },
+    "elbow_flex": {
+      "recorded_ticks": [
+        1152,
+        3283
+      ],
+      "recorded_deg": [
+        -89.7,
+        97.7
+      ],
+      "calibrated_ticks": [
+        1063,
+        3281
+      ],
+      "centred_ticks": null
+    },
+    "wrist_flex": {
+      "recorded_ticks": [
+        1966,
+        3314
+      ],
+      "recorded_deg": [
+        -14.2,
+        104.4
+      ],
+      "calibrated_ticks": [
+        943,
+        3311
+      ],
+      "centred_ticks": null
+    },
+    "wrist_roll": {
+      "recorded_ticks": [
+        694,
+        3433
+      ],
+      "recorded_deg": [
+        -119.0,
+        121.8
+      ],
+      "calibrated_ticks": [
+        0,
+        4095
+      ],
+      "centred_ticks": null
+    },
+    "gripper": {
+      "recorded_ticks": [
+        1312,
+        1314
+      ],
+      "recorded_deg": [
+        -62.1,
+        -61.9
+      ],
+      "calibrated_ticks": [
+        1275,
+        2761
+      ],
+      "centred_ticks": null
+    }
+  }
+}

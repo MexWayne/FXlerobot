@@ -18,6 +18,21 @@ SCALE_PX = 4.0   # the disparity found again on half-size images must agree this
 MIN_Z_M, MAX_Z_M = 0.15, 4.0
 EDGE_PX = 4 + BLOCK  # matches this close to where a camera's picture ends are not trusted
 BACKGROUND_M = 3.0   # the right camera has to see this far behind a pixel for its match to count
+# The floor checks the pair. Since 2026-11-07 evening one camera shifts against the other when the body
+# moves (the left one was replugged that day): its depth then changes from stop to stop and holds while
+# the body stands, the floor 0.4-1 m out came out 3-7 cm high (camera height from the stereo's own floor
+# plane 0.57-0.70 m, really ~0.63), and bare striped carpet became "standing" cells, mapped as obstacles
+# for good (2026-11-09). The floor in the lower half of the picture (pixels whose disparity lies within
+# FLOOR_NEAR_PX of the floor's at that pixel) must come out FLOOR_BASE_Z high within FLOOR_TOL_M, else the
+# pair is not used; looks with too little floor in view (looking up) go by the last verdict.
+# After the cameras were moved and the left one turned back by hand (2026-11-10) the floor reads lower:
+# +0.009/+0.013 at the check, -0.023..+0.004 in the 11 lane looks of 103 that 0.025 +- 0.02 refused.
+# Before, sound grasp-view pairs read 0.019 and lane looks ~0.035; the shifted pairs +0.05..+0.10 and
+# -0.04..-0.10. Recentre after the next board calibration.
+FLOOR_BASE_Z = 0.005
+FLOOR_TOL_M = 0.03
+FLOOR_NEAR_PX = 15.0  # 8 left too little floor in the worst pairs to judge them
+FLOOR_MIN_PIX = 1500
 
 
 class Stereo:
@@ -39,6 +54,12 @@ class Stereo:
         self.inside_r = self._inside(self.map_r, full)
         self.sgbm = self._matcher(NUM_DISP, BLOCK)
         self.sgbm_half = self._matcher(NUM_DISP // 2, 3)
+        q = self.q
+        uu, vv = np.meshgrid(np.arange(SIZE[0], dtype=np.float64), np.arange(SIZE[1], dtype=np.float64))
+        # Each rectified pixel's ray (rectified frame, z = 1) in the left camera's frame.
+        self.rays = np.dstack([(uu + q[0, 3]) / q[2, 3], (vv + q[1, 3]) / q[2, 3], np.ones_like(uu)]) @ self.r1
+        self.trusted = True   # the last pair the floor could check agreed with it
+        self.floor_z = None   # the floor's height (base frame) in the last pair that showed enough of it
 
     @staticmethod
     def _matcher(num_disp, block):
@@ -95,4 +116,26 @@ class Stereo:
         out = np.full(p.shape, np.nan, np.float32)
         cam = p[good] @ self.r1  # rectified left camera -> left camera
         out[good] = cam @ T_base_cam[:3, :3].T + T_base_cam[:3, 3]
+        if not self._floor_agrees(d, good, out, T_base_cam):
+            out[:] = np.nan
         return out
+
+    def _floor_agrees(self, d, good, out, T_base_cam):
+        """False when the floor in the pair is not where it is (FLOOR_*): one camera has moved against
+        the other. Without enough floor in view, the last verdict."""
+        R, t = T_base_cam[:3, :3], T_base_cam[:3, 3]
+        dz = self.rays @ R[2]  # base-frame z of each ray's direction
+        with np.errstate(divide="ignore", invalid="ignore"):
+            depth = np.where(dz < -1e-6, (FLOOR_BASE_Z - t[2]) / dz, np.nan)  # rectified z of the floor
+            d_floor = (self.q[2, 3] / depth - self.q[3, 3]) / self.q[3, 2]
+            near = good & (np.abs(d - d_floor) < FLOOR_NEAR_PX)
+        near[: d.shape[0] // 2] = False
+        if near.sum() < FLOOR_MIN_PIX:
+            return self.trusted
+        self.floor_z = float(np.median(out[near][:, 2]))
+        trusted = abs(self.floor_z - FLOOR_BASE_Z) <= FLOOR_TOL_M
+        if not trusted:
+            print(f"  双目对不上地面：地面量成离地 {self.floor_z:+.3f} m（应为 {FLOOR_BASE_Z:+.3f}），"
+                  "两个头部相机可能松动错位了，这次不用双目", flush=True)
+        self.trusted = trusted
+        return trusted

@@ -109,6 +109,26 @@ def load_calibration(side):
     return json.loads(path.read_text())
 
 
+def range_path(side):
+    """Where joint_range.py --apply keeps the range an arm may use, next to its LeRobot calibration
+    (a name LeRobot does not read)."""
+    path = CALIBRATION[side]
+    return path.with_name(path.stem + "_range.json")
+
+
+def load_range(side):
+    """joint -> (min, max) ticks the arm may use: its calibrated range, widened on each side where
+    joint_range.py --apply measured it turning further. Angles (degrees) still count from the middle of
+    the calibrated range."""
+    out = {n: (c["range_min"], c["range_max"]) for n, c in load_calibration(side).items()}
+    path = range_path(side)
+    if path.is_file():
+        for name, (lo, hi) in json.loads(path.read_text()).items():
+            a, b = out[name]
+            out[name] = (min(a, lo), max(b, hi))
+    return out
+
+
 def degrees(ticks, cal):
     mid = (cal["range_min"] + cal["range_max"]) / 2
     return (ticks - mid) * 360.0 / FULL_TURN
